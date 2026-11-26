@@ -23,13 +23,14 @@ In-memory catalogue of scanner connectors (container images the worker runs), lo
 - The manifest loads once in `onModuleInit` from `path.resolve(process.cwd(), 'resources/connectors/manifest.json')`, so the process must start with `core-api/` as its cwd. A missing file, invalid JSON or an empty `connectors` array only logs a warning, and the registry stays empty: every lookup returns `null`/`[]` and boot does not fail.
 - `resourceDefaults` are validated per field. CPU matches `^[0-9]+(\.[0-9]+)?m?$`. Memory is an integer with an optional `Mi|Gi|Ki|M|G|K` suffix (the worker rejects fractions). `timeoutSeconds` is a positive integer. Each invalid or missing field falls back on its own to `500m` / `512Mi` / `600`, and an unknown slug gets all three defaults.
 - `egress` is `direct` or absent (= proxy). `jobs-registry.controller.ts` and `agents/tools/connector.tools.ts` turn `egress === 'direct'` into `directEgress` on the gRPC Job / ToolRun; the worker then skips its egress proxy for that container. Send it camelCase: proto-loader runs with `keepCase: false` and drops snake_case keys.
+- `configInband: true` marks a connector whose SDK reads its config from `ExecuteJob`; `jobs-registry.controller.ts` sends it as `Job.configInband` and the worker then leaves `OASM_CONFIG` out of the container env. Absent = false (env kept, for images built on older SDKs).
 - `manifest.json` is generated (`task sync-connectors`) and must not be hand-edited. Change the manifest upstream and re-sync.
 - Duplicate slugs in the manifest: the last entry wins (plain `Map.set`).
 
 ## Coupling
 
-- Imported by `tools`, `jobs-registry`, `workers`, `projects` and `agents`. The main callers are `tools.service.ts` / `tool-config-profiles.service.ts` (schemas, config validation), `jobs-registry` (image and resource defaults at dispatch), `workers.service.ts` (`getAllConnectors`, logo URL `/connectors/<slug>.png`), `projects/project-workflows.service.ts`, and `agents/tools/connector.tools.ts` (`getAgentConnectors`, `getResourceDefaults`).
-- `StorageService` is injected without importing `StorageModule`, because that module is `@Global()`.
+- Imported by `tools`, `jobs-registry`, `workers`, `projects` and `agents`. The main callers are `tools.service.ts` / `tool-config-profiles.service.ts` (schemas, config validation), `jobs-registry` (image and resource defaults at dispatch), `workers.service.ts` (`getAllConnectors`, logo URL `/connectors/<slug>.png`), `projects/project-workflows.service.ts`, and `agents/tools/connector.tools.ts` (`getAgentConnectors`, `getResourceDefaults`) and `agents/tools/workspace.tools.ts` (`getConnectorSchema`, for `display_available_tools`).
+- Imports `StorageModule` for `StorageService` (connector logos).
 - Logo files are written by `tools/tool-sync.service.ts` (`connectors/<slug>.png` in the `system` bucket), not by this module.
 - Imports `ManifestCapability` (type only) from `tools/tool-categories`.
 

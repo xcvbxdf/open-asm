@@ -7,6 +7,8 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet';
 import { useAgentChat } from '@/hooks/use-agent-chat';
+import { useDocumentTitle } from '@/hooks/useDocumentTitle';
+import { stripPageContextFromTitle } from '@/lib/page-context';
 import { cn } from '@/lib/utils';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { useParams } from '@tanstack/react-router';
@@ -22,11 +24,17 @@ import {
 import {
   SidePanelResizer,
   useSidePanelWidth,
-} from './components/side-panel-resizer';
+  type PanelLimits,
+} from '@/components/ui/side-panel-resizer';
 import { isSubagentActive } from './components/subagents-panel';
 import { useMediaQuery } from './components/use-media-query';
+import { useT } from '@/lib/i18n-dictionary';
 
 const SIDE_PANEL_STORAGE_KEY = 'agent-side-panel-open';
+const SIDE_PANEL_WIDTH_STORAGE_KEY = 'agent-side-panel-width';
+
+/** Narrowest the side panel and the chat beside it may get */
+const SIDE_PANEL_LIMITS: PanelLimits = { panelMin: 360, restMin: 420 };
 
 // ---------------------------------------------------------------------------
 // AgentsChatPage
@@ -35,6 +43,7 @@ const SIDE_PANEL_STORAGE_KEY = 'agent-side-panel-open';
 export default function AgentsChatPage() {
   const { conversationId } = useParams({ strict: false });
   const isMobile = useIsMobile();
+  const t = useT();
   const isLargeScreen = useMediaQuery('(min-width: 1024px)');
 
   const {
@@ -72,6 +81,9 @@ export default function AgentsChatPage() {
     onDecideApproval,
   } = useAgentChat({ conversationId });
 
+  // The tab shows the chat's title (without a sidebar question's page block)
+  useDocumentTitle(title ? stripPageContextFromTitle(title) : null);
+
   // The side panel opens from the header; the choice is kept per browser
   const [panelOpen, setPanelOpen] = useState(() => {
     try {
@@ -98,7 +110,10 @@ export default function AgentsChatPage() {
   // Split view: the divider shares the row between chat and panel
   const rowRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLElement>(null);
-  const panelWidth = useSidePanelWidth(rowRef);
+  const panelWidth = useSidePanelWidth(rowRef, {
+    storageKey: SIDE_PANEL_WIDTH_STORAGE_KEY,
+    limits: SIDE_PANEL_LIMITS,
+  });
 
   const [selectedToolCallId, setSelectedToolCallId] = useState<string | null>(
     null,
@@ -158,7 +173,7 @@ export default function AgentsChatPage() {
       >
         {/* Chat conversation. Its header floats over the top: the chat
             scrolls under it */}
-        {/* lg:min-w matches CHAT_MIN_WIDTH of the divider */}
+        {/* lg:min-w matches SIDE_PANEL_LIMITS.restMin */}
         <div className="relative flex-1 min-w-0 lg:min-w-[420px] flex flex-col overflow-hidden">
           <ChatHeader
             conversationId={conversationId}
@@ -225,6 +240,9 @@ export default function AgentsChatPage() {
               width={panelWidth.width}
               onResize={panelWidth.setWidth}
               onCommit={panelWidth.save}
+              limits={SIDE_PANEL_LIMITS}
+              label={t('agents.sidePanel.resize')}
+              className="hidden lg:block"
             />
             <aside
               ref={panelRef}
@@ -252,10 +270,9 @@ export default function AgentsChatPage() {
           className="w-full gap-0 p-0 sm:max-w-none [&>button]:hidden"
         >
           <SheetHeader className="sr-only">
-            <SheetTitle>Side panel</SheetTitle>
+            <SheetTitle>{t('agents.sidePanel.title')}</SheetTitle>
             <SheetDescription>
-              Plan, subagents, browser, tool calls and stats of this
-              conversation.
+              {t('agents.sidePanel.description')}
             </SheetDescription>
           </SheetHeader>
           {renderSidePanel(() => setSheetOpen(false))}

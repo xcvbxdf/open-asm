@@ -1,111 +1,30 @@
 import { Public, WorkspaceId } from '@/common/decorators/app.decorator';
+import { CurrentWorker } from '@/common/decorators/current-worker.decorator';
 import { WorkerTokenAuth } from '@/common/decorators/worker-token-auth.decorator';
 import { Doc } from '@/common/doc/doc.decorator';
 import { DefaultMessageResponseDto } from '@/common/dtos/default-message-response.dto';
 import { GetManyBaseResponseDto } from '@/common/dtos/get-many-base.dto';
 import { IdQueryParamDto } from '@/common/dtos/id-query-param.dto';
-import { Severity, ToolCategory } from '@/common/enums/enum';
-import { GrpcWorkerTokenGuard } from '@/common/guards/grpc-worker-token.guard';
+import { ToolCategory } from '@/common/enums/enum';
 import { WorkspaceAccess } from '@/common/decorators/workspace-access.decorator';
-import { GetManyResponseDto } from '@/utils/getManyResponse';
-import {
-  Body,
-  Controller,
-  Delete,
-  Get,
-  Logger,
-  Param,
-  Post,
-  Query,
-  UseGuards,
-} from '@nestjs/common';
-import { GrpcMethod } from '@nestjs/microservices';
-import { plainToInstance } from 'class-transformer';
+import { GetManyResponseDto } from '@/common/utils/get-many-response.util';
+import { Body, Controller, Delete, Get, Logger, Param, Post, Query } from '@nestjs/common';
 import { EVENT_CATALOG } from '../event-bridge/contracts/event-catalog';
 import { PublishEvent } from '../event-bridge/publishing/publish-event.decorator';
-import { Asset } from '../assets/entities/assets.entity';
-import { DiscoveredUrl } from '../assets/entities/discovered-url.entity';
-import { HttpResponse } from '../assets/entities/http-response.entity';
-import { Vulnerability } from '../vulnerabilities/entities/vulnerability.entity';
-import { ConnectorRegistryService } from '../connectors/connector-registry.service';
-import { IntegrationsService } from '../integrations/integrations.service';
-import { ToolConfigProfilesService } from '../tools/tool-config-profiles.service';
+import { WorkerInstance } from '../workers/entities/worker.entity';
 import { WorkflowRunnerService } from './workflow-runner.service';
-import {
-  buildConnectorInputs,
-  isRepositoryAsset,
-  repositoryUsername,
-} from './connector-inputs';
-import { GetManyJobHistoriesRequestDto } from './dto/get-many-job-histories-dto';
-import { GetManyJobsRequestDto } from './dto/get-many-jobs-dto';
+import { GetManyJobHistoriesRequestDto } from './dto/get-many-job-histories.dto';
+import { GetManyJobsRequestDto } from './dto/get-many-jobs.dto';
 import { JobListItemDto } from './dto/job-list-item.dto';
 import { RetryRunResponseDto } from './dto/retry-run-response.dto';
 import { JobHistoryDetailResponseDto } from './dto/job-history-detail.dto';
 import { JobHistoryResponseDto } from './dto/job-history.dto';
 import { JobHistoryWorkflowResponseDto } from './dto/job-history-workflow.dto';
-import {
-  GetNextJobResponseDto,
-  GetNextJobResult,
-  HttpProbeResultDto,
-  JobTimelineResponseDto,
-  PortsResultDto,
-  ScreenshotResultDto,
-  SubdomainResultDto,
-  UpdateResultDto,
-  UrlDiscoveryResultDto,
-  VulnerabilitiesResultDto,
-  WorkerIdParams,
-} from './dto/jobs-registry.dto';
+import { GetNextJobResponseDto, HttpProbeResultDto, JobTimelineResponseDto, PortsResultDto, ScreenshotResultDto, SubdomainResultDto, UpdateResultDto, UrlDiscoveryResultDto, VulnerabilitiesResultDto, WorkerIdParams } from './dto/jobs-registry.dto';
+import { JobDispatchService } from './job-dispatch.service';
+import { JobHistoryQueryService } from './job-history-query.service';
 import { JobsRegistryService } from './jobs-registry.service';
-
-/**
- * Packs a single JSON-ish value into a `google.protobuf.Value` wire object.
- * protobufjs only reads the `fields` key of a Struct (and the oneof key of a
- * Value), so plain records/values are silently dropped during gRPC encoding.
- */
-function packStructValue(value: unknown): Record<string, unknown> {
-  if (value === null) return { nullValue: 0 };
-  switch (typeof value) {
-    case 'string':
-      return { stringValue: value };
-    case 'number':
-      return { numberValue: value };
-    case 'boolean':
-      return { boolValue: value };
-    case 'object':
-      if (Array.isArray(value)) {
-        return { listValue: { values: value.map(packStructValue) } };
-      }
-      return {
-        structValue: { fields: packStructFields(value as Record<string, unknown>) },
-      };
-    default:
-      // undefined / function / symbol — not JSON-representable; omit at field level
-      return { nullValue: 0 };
-  }
-}
-
-/** Packs a plain record into a `google.protobuf.Struct` `fields` map. */
-function packStructFields(record: Record<string, unknown>): Record<string, Record<string, unknown>> {
-  const fields: Record<string, Record<string, unknown>> = {};
-  for (const [key, val] of Object.entries(record)) {
-    if (val !== undefined) fields[key] = packStructValue(val);
-  }
-  return fields;
-}
-
-const VALID_SEVERITIES = new Set<string>(Object.values(Severity));
-
-/**
- * The gRPC loader is configured with `enums: String`, so the worker delivers
- * severity as the proto enum NAME (e.g. "HIGH"). Normalize it to the domain's
- * lowercase `Severity` at this trust boundary; anything unrecognized falls
- * back to `info`.
- */
-function normalizeSeverity(value: unknown): Severity {
-  const lower = typeof value === 'string' ? value.toLowerCase() : '';
-  return VALID_SEVERITIES.has(lower) ? (lower as Severity) : Severity.INFO;
-}
+import { authenticatedWorkerId } from './worker-identity';
 
 @Controller('jobs-registry')
 export class JobsRegistryController {
@@ -113,10 +32,9 @@ export class JobsRegistryController {
 
   constructor(
     private readonly jobsRegistryService: JobsRegistryService,
-    private readonly connectorRegistry: ConnectorRegistryService,
-    private readonly toolConfigProfilesService: ToolConfigProfilesService,
-    private readonly integrationsService: IntegrationsService,
     private readonly workflowRunnerService: WorkflowRunnerService,
+    private readonly jobHistoryQuery: JobHistoryQueryService,
+    private readonly jobDispatch: JobDispatchService,
   ) {}
 
   @WorkspaceAccess('job.read')
@@ -152,7 +70,7 @@ export class JobsRegistryController {
   })
   @Get('/timeline')
   getJobsTimeline(@WorkspaceId() workspaceId: string) {
-    return this.jobsRegistryService.getJobsTimeline(workspaceId);
+    return this.jobHistoryQuery.getJobsTimeline(workspaceId);
   }
 
   @Doc({
@@ -165,8 +83,13 @@ export class JobsRegistryController {
   @WorkerTokenAuth()
   @Public()
   @Get('/:workerId/next')
-  async getNextJob(@Param() { workerId }: WorkerIdParams) {
-    const job = await this.jobsRegistryService.getNextJob(workerId);
+  async getNextJob(
+    @Param() { workerId }: WorkerIdParams,
+    @CurrentWorker() worker: WorkerInstance,
+  ) {
+    const job = await this.jobDispatch.getNextJob(
+      authenticatedWorkerId(this.logger, worker, workerId),
+    );
     return job;
   }
 
@@ -180,8 +103,12 @@ export class JobsRegistryController {
   updateResult(
     @Param() { workerId }: WorkerIdParams,
     @Body() dto: UpdateResultDto,
+    @CurrentWorker() worker: WorkerInstance,
   ) {
-    return this.jobsRegistryService.updateResult(workerId, dto);
+    return this.jobsRegistryService.updateResult(
+      authenticatedWorkerId(this.logger, worker, workerId),
+      dto,
+    );
   }
 
   // --- Category-Specific Result Endpoints ---
@@ -196,9 +123,10 @@ export class JobsRegistryController {
   updateSubdomainResult(
     @Param() { workerId }: WorkerIdParams,
     @Body() dto: SubdomainResultDto,
+    @CurrentWorker() worker: WorkerInstance,
   ) {
     return this.jobsRegistryService.updateResultByCategory(
-      workerId,
+      authenticatedWorkerId(this.logger, worker, workerId),
       dto,
       ToolCategory.SUBDOMAINS,
     );
@@ -214,9 +142,10 @@ export class JobsRegistryController {
   updateHttpProbeResult(
     @Param() { workerId }: WorkerIdParams,
     @Body() dto: HttpProbeResultDto,
+    @CurrentWorker() worker: WorkerInstance,
   ) {
     return this.jobsRegistryService.updateResultByCategory(
-      workerId,
+      authenticatedWorkerId(this.logger, worker, workerId),
       dto,
       ToolCategory.HTTP_PROBE,
     );
@@ -232,9 +161,10 @@ export class JobsRegistryController {
   updatePortsResult(
     @Param() { workerId }: WorkerIdParams,
     @Body() dto: PortsResultDto,
+    @CurrentWorker() worker: WorkerInstance,
   ) {
     return this.jobsRegistryService.updateResultByCategory(
-      workerId,
+      authenticatedWorkerId(this.logger, worker, workerId),
       dto,
       ToolCategory.PORTS_SCANNER,
     );
@@ -250,9 +180,10 @@ export class JobsRegistryController {
   updateVulnerabilitiesResult(
     @Param() { workerId }: WorkerIdParams,
     @Body() dto: VulnerabilitiesResultDto,
+    @CurrentWorker() worker: WorkerInstance,
   ) {
     return this.jobsRegistryService.updateResultByCategory(
-      workerId,
+      authenticatedWorkerId(this.logger, worker, workerId),
       dto,
       ToolCategory.VULNERABILITIES,
     );
@@ -268,9 +199,10 @@ export class JobsRegistryController {
   updateScreenshotResult(
     @Param() { workerId }: WorkerIdParams,
     @Body() dto: ScreenshotResultDto,
+    @CurrentWorker() worker: WorkerInstance,
   ) {
     return this.jobsRegistryService.updateResultByCategory(
-      workerId,
+      authenticatedWorkerId(this.logger, worker, workerId),
       dto,
       ToolCategory.SCREENSHOT,
     );
@@ -286,9 +218,10 @@ export class JobsRegistryController {
   updateUrlDiscoveryResult(
     @Param() { workerId }: WorkerIdParams,
     @Body() dto: UrlDiscoveryResultDto,
+    @CurrentWorker() worker: WorkerInstance,
   ) {
     return this.jobsRegistryService.updateResultByCategory(
-      workerId,
+      authenticatedWorkerId(this.logger, worker, workerId),
       dto,
       ToolCategory.URL_DISCOVERY,
     );
@@ -311,7 +244,7 @@ export class JobsRegistryController {
     @WorkspaceId() workspaceId: string,
     @Query() query: GetManyJobHistoriesRequestDto,
   ): Promise<GetManyBaseResponseDto<JobHistoryResponseDto>> {
-    return this.jobsRegistryService.getManyJobHistories(workspaceId, query);
+    return this.jobHistoryQuery.getManyJobHistories(workspaceId, query);
   }
 
   @WorkspaceAccess('job.read')
@@ -331,7 +264,7 @@ export class JobsRegistryController {
     @WorkspaceId() workspaceId: string,
     @Param('id') id: string,
   ): Promise<JobHistoryDetailResponseDto> {
-    return this.jobsRegistryService.getJobHistoryDetail(workspaceId, id);
+    return this.jobHistoryQuery.getJobHistoryDetail(workspaceId, id);
   }
 
   @WorkspaceAccess('job.read')
@@ -351,7 +284,7 @@ export class JobsRegistryController {
     @WorkspaceId() workspaceId: string,
     @Param('id') id: string,
   ): Promise<JobHistoryWorkflowResponseDto> {
-    return this.jobsRegistryService.getJobHistoryWorkflow(workspaceId, id);
+    return this.jobHistoryQuery.getJobHistoryWorkflow(workspaceId, id);
   }
 
   @WorkspaceAccess('job.write')
@@ -452,365 +385,6 @@ export class JobsRegistryController {
     @Param() params: IdQueryParamDto,
   ) {
     return this.jobsRegistryService.deleteJob(workspaceId, params.id);
-  }
-
-  @UseGuards(GrpcWorkerTokenGuard)
-  @GrpcMethod('JobsRegistryService', 'Next')
-  async next(worker: { id: string }): Promise<Record<string, unknown>> {
-    const job = await this.jobsRegistryService.getNextJob(worker.id);
-
-    if (!job) {
-      return { id: '', asset: {}, command: '' };
-    }
-
-    return this.mapJobToGrpcJob(job);
-  }
-
-  /**
-   * Batched claim. Returns every job this worker can start right now — up to
-   * the `limit` it asks for, capped server-side — in one round-trip and one
-   * transaction, instead of one `Next` per free concurrency slot.
-   *
-   * An empty list is the "no work" signal, the same meaning as an empty `id`
-   * from `Next`. The worker sizes `limit` from its free slots, so the server
-   * never hands back more jobs than it can start.
-   */
-  @UseGuards(GrpcWorkerTokenGuard)
-  @GrpcMethod('JobsRegistryService', 'NextBatch')
-  async nextBatch(request: {
-    id: string;
-    limit: number;
-  }): Promise<{ values: Record<string, unknown>[] }> {
-    const jobs = await this.jobsRegistryService.getNextJobs(
-      request.id,
-      Number(request.limit) || 1,
-    );
-
-    const values = await Promise.all(
-      jobs.map((job) => this.mapJobToGrpcJob(job)),
-    );
-
-    return { values };
-  }
-
-  /**
-   * Maps one claimed job to the gRPC `Job` wire shape. Shared by `Next` and
-   * `NextBatch` so the two paths can never drift apart.
-   */
-  /**
-   * Inputs of a connector job. A repository asset (GIT_ORG target) gets its
-   * clone URL plus the integration's token, decrypted here for this dispatch
-   * only — never persisted on the job. Without a usable integration the job
-   * still runs, unauthenticated (public repositories).
-   */
-  private async resolveConnectorInputs(
-    job: GetNextJobResult,
-  ): Promise<Record<string, string>> {
-    const asset = job.asset as unknown as {
-      value: string;
-      metadata?: Record<string, unknown> | null;
-      target?: { type?: string; integrationId?: string | null } | null;
-    };
-    if (!isRepositoryAsset(asset)) {
-      // Jobs planned per service or URL carry their own inputs; older jobs
-      // (and host jobs) fall back to the asset.
-      return job.inputs ?? buildConnectorInputs(asset);
-    }
-
-    const integrationId = asset.target?.integrationId;
-    if (!integrationId || !job.workspaceId) {
-      return buildConnectorInputs(asset);
-    }
-    try {
-      const { integration, decryptedConfig } =
-        await this.integrationsService.getIntegrationWithDecryptedConfig(
-          integrationId,
-          job.workspaceId,
-        );
-      const token = decryptedConfig.apiToken;
-      return buildConnectorInputs(
-        asset,
-        typeof token === 'string' && token
-          ? { username: repositoryUsername(integration.appType), token }
-          : null,
-      );
-    } catch {
-      // Never log the decrypted payload — generic message only.
-      this.logger.warn(
-        `repository credentials unavailable for job ${job.id}; dispatching unauthenticated`,
-      );
-      return buildConnectorInputs(asset);
-    }
-  }
-
-  private async mapJobToGrpcJob(
-    job: GetNextJobResult,
-  ): Promise<Record<string, unknown>> {
-    // Connector path: tool metadata present → look up registry
-    const connectorEntry = job.tool
-      ? this.connectorRegistry.getConnector(job.tool.name)
-      : null;
-
-    if (connectorEntry?.image) {
-      let config: Record<string, unknown> | undefined;
-      try {
-        config =
-          await this.toolConfigProfilesService.resolveConfigForJob(
-            job.workspaceId!,
-            job.tool!.id,
-            { config: job.config ?? undefined, configProfileId: job.configProfileId },
-          );
-      } catch {
-        // Never log decrypted payload — generic message only
-        this.logger.warn('profile decrypt failed');
-      }
-
-      // Manifest resource limits — scheduling context for the worker runtime.
-      // Keys are camelCase: proto-loader (keepCase: false) drops snake_case.
-      const defaults = this.connectorRegistry.getResourceDefaults(
-        job.tool!.name,
-      );
-
-      const response: Record<string, unknown> = {
-        id: job.id,
-        asset: job.asset,
-        category: job.category,
-        // The worker derives the connector container name and the in-container
-        // TOOL env var from this field, so it must be the manifest slug — the
-        // stable identifier connectors are addressed by everywhere else. The
-        // display name is long, not unique, and sanitizes into names like
-        // "oasm-nikto---web-server-scanner-ghcr-io-00fe". A malformed manifest
-        // without a slug falls back to the name so the job still runs.
-        tool: connectorEntry.slug || connectorEntry.name,
-        image: connectorEntry.image,
-        cpu: defaults.cpu,
-        memory: defaults.memory,
-        timeoutSeconds: defaults.timeoutSeconds,
-        directEgress: connectorEntry.egress === 'direct',
-        inputs: {
-          fields: packStructFields(await this.resolveConnectorInputs(job)),
-        },
-      };
-
-      if (config && Object.keys(config).length > 0) {
-        response.config = { fields: packStructFields(config) };
-      }
-
-      return response;
-    }
-
-    // Legacy path — byte-for-byte compatible
-    return {
-      id: job.id,
-      asset: job.asset,
-      command: job.command,
-      category: job.category,
-    };
-  }
-
-  // --- Deprecated gRPC Method ---
-
-  @UseGuards(GrpcWorkerTokenGuard)
-  @GrpcMethod('JobsRegistryService', 'Result')
-  async result({
-    workerId,
-    data,
-  }: {
-    workerId: string;
-    data: UpdateResultDto;
-  }): Promise<{ success: boolean }> {
-    const transformedData = plainToInstance(UpdateResultDto, data, {
-      enableImplicitConversion: true,
-      excludeExtraneousValues: true,
-    });
-    const result = await this.jobsRegistryService.updateResult(
-      workerId,
-      transformedData,
-    );
-    if (!result.jobId)
-      return {
-        success: false,
-      };
-
-    return {
-      success: true,
-    };
-  }
-
-  // --- Category-Specific gRPC Methods ---
-
-  @UseGuards(GrpcWorkerTokenGuard)
-  @GrpcMethod('JobsRegistryService', 'ResultSubdomains')
-  async resultSubdomains({
-    workerId,
-    jobId,
-    error,
-    raw,
-    assets,
-  }: {
-    workerId: string;
-    jobId: string;
-    error: boolean;
-    raw?: string;
-    assets?: { values: Asset[] };
-  }): Promise<{ success: boolean }> {
-    const dto = plainToInstance(SubdomainResultDto, {
-      jobId,
-      error,
-      raw,
-      payload: assets?.values,
-    });
-    const result = await this.jobsRegistryService.updateResultByCategory(
-      workerId,
-      dto,
-      ToolCategory.SUBDOMAINS,
-    );
-    return { success: !!result.jobId };
-  }
-
-  @UseGuards(GrpcWorkerTokenGuard)
-  @GrpcMethod('JobsRegistryService', 'ResultHttpProbe')
-  async resultHttpProbe({
-    workerId,
-    jobId,
-    error,
-    raw,
-    httpResponse,
-  }: {
-    workerId: string;
-    jobId: string;
-    error: boolean;
-    raw?: string;
-    httpResponse?: HttpResponse;
-  }): Promise<{ success: boolean }> {
-    const dto = plainToInstance(HttpProbeResultDto, {
-      jobId,
-      error,
-      raw,
-      payload: httpResponse,
-    });
-    const result = await this.jobsRegistryService.updateResultByCategory(
-      workerId,
-      dto,
-      ToolCategory.HTTP_PROBE,
-    );
-    return { success: !!result.jobId };
-  }
-
-  @UseGuards(GrpcWorkerTokenGuard)
-  @GrpcMethod('JobsRegistryService', 'ResultPorts')
-  async resultPorts({
-    workerId,
-    jobId,
-    error,
-    raw,
-    numbers,
-  }: {
-    workerId: string;
-    jobId: string;
-    error: boolean;
-    raw?: string;
-    numbers?: { values: number[] };
-  }): Promise<{ success: boolean }> {
-    const dto = plainToInstance(PortsResultDto, {
-      jobId,
-      error,
-      raw,
-      payload: numbers?.values,
-    });
-    const result = await this.jobsRegistryService.updateResultByCategory(
-      workerId,
-      dto,
-      ToolCategory.PORTS_SCANNER,
-    );
-    return { success: !!result.jobId };
-  }
-
-  @UseGuards(GrpcWorkerTokenGuard)
-  @GrpcMethod('JobsRegistryService', 'ResultVulnerabilities')
-  async resultVulnerabilities({
-    workerId,
-    jobId,
-    error,
-    raw,
-    vulnerabilities,
-  }: {
-    workerId: string;
-    jobId: string;
-    error: boolean;
-    raw?: string;
-    vulnerabilities?: { values: Vulnerability[] };
-  }): Promise<{ success: boolean }> {
-    const dto = plainToInstance(VulnerabilitiesResultDto, {
-      jobId,
-      error,
-      raw,
-      payload: vulnerabilities?.values?.map((vuln) => ({
-        ...vuln,
-        severity: normalizeSeverity(vuln.severity),
-      })),
-    });
-    const result = await this.jobsRegistryService.updateResultByCategory(
-      workerId,
-      dto,
-      ToolCategory.VULNERABILITIES,
-    );
-    return { success: !!result.jobId };
-  }
-
-  @UseGuards(GrpcWorkerTokenGuard)
-  @GrpcMethod('JobsRegistryService', 'ResultScreenshot')
-  async resultScreenshot({
-    workerId,
-    jobId,
-    error,
-    raw,
-  }: {
-    workerId: string;
-    jobId: string;
-    error: boolean;
-    raw?: string;
-  }): Promise<{ success: boolean }> {
-    const dto = plainToInstance(ScreenshotResultDto, {
-      jobId,
-      error,
-      raw,
-    });
-    const result = await this.jobsRegistryService.updateResultByCategory(
-      workerId,
-      dto,
-      ToolCategory.SCREENSHOT,
-    );
-    return { success: !!result.jobId };
-  }
-
-  @UseGuards(GrpcWorkerTokenGuard)
-  @GrpcMethod('JobsRegistryService', 'ResultUrlDiscovery')
-  async resultUrlDiscovery({
-    workerId,
-    jobId,
-    error,
-    raw,
-    urls,
-  }: {
-    workerId: string;
-    jobId: string;
-    error: boolean;
-    raw?: string;
-    urls?: DiscoveredUrl[];
-  }): Promise<{ success: boolean }> {
-    const dto = plainToInstance(UrlDiscoveryResultDto, {
-      jobId,
-      error,
-      raw,
-      payload: urls ?? [],
-    });
-    const result = await this.jobsRegistryService.updateResultByCategory(
-      workerId,
-      dto,
-      ToolCategory.URL_DISCOVERY,
-    );
-    return { success: !!result.jobId };
   }
 
 }

@@ -5,8 +5,8 @@ description: "Started manually from finding details or dispatched to re-check on
 mode: subagent
 maxSteps: 40
 temperature: 0.2
-tools: [investigate_vulnerability, inspect_asset, list_network_ports, fingerprint_technologies, display_available_tools, run_tool_connector, execute_remote_command, read_tool_output, retrieve_web_page, propose_vulnerability, stm_write]
-skills: [vulnerability-analysis, exploit-verification]
+tools: [investigate_vulnerability, query_attack_surface, describe_attack_surface, display_available_tools, run_tool_connector, execute_remote_command, read_tool_output, retrieve_web_page, propose_vulnerability, stm_write]
+skills: [attack-surface-query, vulnerability-analysis, exploit-verification]
 ---
 
 # Finding retest
@@ -29,7 +29,7 @@ Exactly one of **Still vulnerable**, **Fixed** or **Inconclusive**, followed by 
 
 ## Tools
 
-Check the tool you need with `display_available_tools`: only `isReady` entries run, and `type` decides the call (`built_in` → `execute_remote_command` by name, `connector` → `run_tool_connector`). Read long output with `read_tool_output` and a `pattern`. If the tool is missing or not ready, conclude **Inconclusive** and name it.
+Check the tool you need with `display_available_tools`: `type` decides the call (`built_in` → `execute_remote_command` by name, `connector` → `run_tool_connector`, with `config` set from its fields to reproduce the original run). Read long output with `read_tool_output` and a `pattern`. If the tool is missing, or needs a secret no config profile provides, conclude **Inconclusive** and name it.
 
 Use `propose_vulnerability` only to confirm the finding you retest: on **Still vulnerable**, call it with `verifiesVulnerabilityId` set to that finding and the new evidence, citing the proving stdout lines in `evidence.citations` as `{runId, quote}` (the `runId` of the `execute_remote_command` / `run_tool_connector` result, the quote copied verbatim from it, 8-500 characters, no secret). The server checks each quote against the stored output; fix any `not_found` quote and call again. Never propose a new finding from a retest.
 

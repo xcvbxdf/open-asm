@@ -48,7 +48,7 @@ export class WorkerInstance extends BaseEntity {
   @Column({ type: 'uuid', nullable: true })
   workspaceId: string;
 
-  @ManyToOne(() => Workspace, (workspace) => workspace.workers, {
+  @ManyToOne(() => Workspace, {
     onDelete: 'CASCADE',
   })
   @JoinColumn({ name: 'workspaceId' })
@@ -93,6 +93,13 @@ export class WorkerInstance extends BaseEntity {
   @ApiProperty({ required: false, enum: ['cli', 'node'], nullable: true })
   @Column({ type: 'varchar', nullable: true })
   runMode: string | null;
+
+  /**
+   * Base64 HPKE public key the worker sent on Join; job secrets are sealed to
+   * it. Registered once and never replaced (see WorkersService.rejoinWorker).
+   */
+  @Column({ type: 'text', nullable: true })
+  encryptionPublicKey: string | null;
 
   @ApiProperty({ required: false })
   isOnline?: boolean;

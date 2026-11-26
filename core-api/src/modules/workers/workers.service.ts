@@ -1,5 +1,7 @@
-import type { WrapperType } from '@/common/types/app.types';
-import { WORKER_TIMEOUT } from '@/common/constants/app.constants';
+import {
+  LAST_SEEN_WRITE_INTERVAL_MS,
+  WORKER_TIMEOUT,
+} from '@/common/constants/app.constants';
 import { GetManyBaseResponseDto } from '@/common/dtos/get-many-base.dto';
 import {
   AuditOutcome,
@@ -10,23 +12,16 @@ import {
 import { isPublicIp, unmapIpv4 } from '@/common/utils/ip-range.util';
 import { GeoIpService } from '@/services/geo-ip/geo-ip.service';
 import { RedisService } from '@/services/redis/redis.service';
-import { generateToken } from '@/utils/genToken';
-import { getManyResponse } from '@/utils/getManyResponse';
-import {
-  forwardRef,
-  Inject,
-  Injectable,
-  Logger,
-  NotFoundException,
-  UnauthorizedException,
-} from '@nestjs/common';
+import { generateToken } from '@/common/utils/gen-token.util';
+import { getManyResponse } from '@/common/utils/get-many-response.util';
+import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { RpcException } from '@nestjs/microservices';
 import { Interval } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
+import { isUUID } from 'class-validator';
 import { randomUUID } from 'crypto';
 import { LessThan, Repository, SelectQueryBuilder } from 'typeorm';
-import { Asset } from '../assets/entities/assets.entity';
 import { ConnectorRegistryService } from '../connectors/connector-registry.service';
 import {
   type CatalogEvent,
@@ -36,8 +31,8 @@ import type { EventEnvelopeData } from '../event-bridge/contracts/event-envelope
 import { EventBridgeService } from '../event-bridge/publishing/event-bridge.service';
 import { InternalNetwork } from '../internal-networks/entities/internal-network.entity';
 import { NetworkInterface } from '../internal-networks/entities/network-interface.entity';
-import { JobsRegistryService } from '../jobs-registry/jobs-registry.service';
-import { WorkspaceTool } from '../tools/entities/workspace_tools.entity';
+import { isValidEncryptionPublicKey } from '../jobs-registry/job-secret-sealer';
+import { Job } from '../jobs-registry/entities/job.entity';
 import { ToolsService } from '../tools/tools.service';
 import { Workspace } from '../workspaces/entities/workspace.entity';
 import {
@@ -58,6 +53,7 @@ import {
   WorkerToolJobDto,
 } from './dto/workers.dto';
 import { WorkerInstance } from './entities/worker.entity';
+import { NotFoundError, UnauthenticatedError } from '@/common/errors/domain.errors';
 
 /** Longest worker name stored; a worker reports it, so it is untrusted input. */
 export const WORKER_NAME_MAX_LENGTH = 128;
@@ -66,6 +62,23 @@ export const WORKER_NAME_MAX_LENGTH = 128;
 function normalizeWorkerName(name: string | undefined): string | undefined {
   const trimmed = name?.trim();
   return trimmed ? trimmed.slice(0, WORKER_NAME_MAX_LENGTH) : undefined;
+}
+
+/**
+ * Most running job ids a rejoin takes from a worker. Far above any real
+ * concurrency; it only bounds what an untrusted list can make us process.
+ */
+export const MAX_REPORTED_RUNNING_JOBS = 10_000;
+
+/** The reported running job ids that are UUIDs, deduplicated and capped. */
+function sanitizeRunningJobIds(ids: readonly string[] | undefined): string[] {
+  if (!Array.isArray(ids)) return [];
+  const valid = new Set<string>();
+  for (const id of ids) {
+    if (valid.size >= MAX_REPORTED_RUNNING_JOBS) break;
+    if (typeof id === 'string' && isUUID(id)) valid.add(id);
+  }
+  return [...valid];
 }
 
 /**
@@ -82,11 +95,7 @@ export class WorkersService {
     @InjectRepository(WorkerInstance)
     public readonly repo: Repository<WorkerInstance>,
 
-    @InjectRepository(Asset)
-    public readonly assetRepo: Repository<Asset>,
 
-    @InjectRepository(WorkspaceTool)
-    public readonly workspaceToolRepo: Repository<WorkspaceTool>,
 
     @InjectRepository(InternalNetwork)
     private internalNetworkRepo: Repository<InternalNetwork>,
@@ -94,15 +103,14 @@ export class WorkersService {
     @InjectRepository(NetworkInterface)
     private networkInterfaceRepo: Repository<NetworkInterface>,
 
-    @Inject(forwardRef(() => JobsRegistryService))
-    private jobsRegistryService: WrapperType<JobsRegistryService>,
+    @InjectRepository(Job)
+    private readonly jobRepository: Repository<Job>,
 
     private readonly workerJoinKeyService: WorkerJoinKeyService,
 
     private configService: ConfigService,
 
-    @Inject(forwardRef(() => ToolsService))
-    private toolsService: WrapperType<ToolsService>,
+    private toolsService: ToolsService,
 
     private redisService: RedisService,
 
@@ -131,12 +139,18 @@ export class WorkersService {
     });
 
     if (!worker) {
-      throw new UnauthorizedException('Invalid token');
+      throw new UnauthenticatedError('Invalid token');
     }
 
-    await this.repo.update({ token: dto.token }, { lastSeenAt: new Date() });
+    // Every connected worker heartbeats every 10 s; the sweep only needs the
+    // timestamp under WORKER_TIMEOUT, so most heartbeats write nothing.
+    const now = Date.now();
+    if (now - worker.lastSeenAt.getTime() >= LAST_SEEN_WRITE_INTERVAL_MS) {
+      worker.lastSeenAt = new Date(now);
+      await this.repo.update({ id: worker.id }, { lastSeenAt: worker.lastSeenAt });
+    }
 
-    return this.repo.findOne({ where: { token: dto.token } });
+    return worker;
   }
 
   /**
@@ -190,12 +204,14 @@ export class WorkersService {
   }
 
   /**
-   * Handles a dropped gRPC alive stream: frees the worker's jobs for other
-   * workers and announces the disconnect. The row stays until
-   * {@link autoCleanupWorkersAndJobs} times it out, so a reconnect is cheap.
+   * Handles a dropped gRPC alive stream: announces the disconnect. The jobs
+   * stay with the worker: a stream drops on a core-api restart or a network
+   * blip while the worker keeps running them, and releasing them then had
+   * another worker run them again. A worker that comes back rejoins and
+   * reports what it still runs; one that does not is timed out by
+   * {@link autoCleanupWorkersAndJobs}, which frees its jobs.
    */
   public async workerDisconnected(workerId: string) {
-    await this.releaseWorkerJobs(workerId);
     const worker = await this.repo.findOne({ where: { id: workerId } });
     await this.publishWorkerEvent(EVENT_CATALOG.worker.disconnected, worker);
   }
@@ -235,7 +251,7 @@ export class WorkersService {
    * workers can pick up the freed jobs immediately.
    */
   public async releaseWorkerJobs(workerId: string) {
-    await this.jobsRegistryService.repo
+    await this.jobRepository
       .createQueryBuilder('jobs')
       .update()
       .set({ status: JobStatus.PENDING, workerId: undefined })
@@ -344,7 +360,7 @@ export class WorkersService {
 
     const workersWithJobCount = await Promise.all(
       workers.map(async (worker) => {
-        const count = await this.jobsRegistryService['repo'].count({
+        const count = await this.jobRepository.count({
           where: {
             workerId: worker.id,
             status: JobStatus.IN_PROGRESS,
@@ -407,7 +423,7 @@ export class WorkersService {
 
     const jobCounts = new Map<string, number>();
     if (workers.length > 0) {
-      const rows = await this.jobsRegistryService['repo']
+      const rows = await this.jobRepository
         .createQueryBuilder('j')
         .select('j.workerId', 'workerId')
         .addSelect('COUNT(*)', 'count')
@@ -547,7 +563,7 @@ export class WorkersService {
     });
 
     if (!worker) {
-      throw new NotFoundException('Worker not found');
+      throw new NotFoundError('Worker not found');
     }
 
     const isVisible =
@@ -555,7 +571,7 @@ export class WorkersService {
         ? canReadGlobal
         : worker.workspaceId === workspaceId;
     if (!isVisible) {
-      throw new NotFoundException('Worker not found');
+      throw new NotFoundError('Worker not found');
     }
 
     const [{ data: builtInTools }, telemetry] = await Promise.all([
@@ -695,7 +711,7 @@ export class WorkersService {
     jobsByTool: Map<string, WorkerToolJobDto[]>;
     currentJobsCount: number;
   }> {
-    const rows = await this.jobsRegistryService['repo']
+    const rows = await this.jobRepository
       .createQueryBuilder('job')
       .leftJoin('job.tool', 'tool')
       .leftJoin('job.asset', 'asset')
@@ -732,7 +748,7 @@ export class WorkersService {
       jobsByTool.set(row.tool, list);
     }
 
-    const currentJobsCount = await this.jobsRegistryService['repo'].count({
+    const currentJobsCount = await this.jobRepository.count({
       where: { workerId, status: JobStatus.IN_PROGRESS },
     });
 
@@ -753,10 +769,28 @@ export class WorkersService {
    * @param dto - The data transfer object containing the API key.
    * @returns A promise that resolves to the created worker instance.
    */
-  public async join(dto: WorkerJoinDto): Promise<WorkerInstance> {
+  public async join(
+    dto: WorkerJoinDto,
+    {
+      runningJobIds,
+    }: {
+      /**
+       * Jobs the worker still runs (gRPC `JoinRequest.running_job_ids`). On a
+       * rejoin they stay IN_PROGRESS; the worker's other IN_PROGRESS jobs go
+       * back to PENDING. Untrusted: malformed ids are dropped.
+       */
+      runningJobIds?: readonly string[];
+    } = {},
+  ): Promise<WorkerInstance> {
     const { apiKey, token, metadata, ipAddress } = dto;
+    const stillRunning = sanitizeRunningJobIds(runningJobIds);
     const runMode = this.mapRunMode(metadata?.mode);
     const name = normalizeWorkerName(metadata?.name);
+    const encryptionPublicKey =
+      dto.encryptionPublicKey?.length &&
+      (await isValidEncryptionPublicKey(dto.encryptionPublicKey))
+        ? dto.encryptionPublicKey.toString('base64')
+        : undefined;
 
     const existingWorker = token
       ? await this.repo.findOne({ where: { token } })
@@ -775,6 +809,8 @@ export class WorkersService {
       ) {
         return this.rejoinWorker(existingWorker, ipAddress, runMode, name, {
           joinKeyId: joinKey.id,
+          encryptionPublicKey,
+          stillRunning,
         });
       }
       const worker = await this.createWorkspaceWorker(
@@ -782,6 +818,7 @@ export class WorkersService {
         { ...metadata, name },
         ipAddress,
         runMode,
+        encryptionPublicKey,
       );
       await this.publishWorkerEvent(EVENT_CATALOG.worker.joined, worker, {
         joinKeyId: joinKey.id,
@@ -791,29 +828,56 @@ export class WorkersService {
 
     // 2. Token rejoin
     if (existingWorker) {
-      return this.rejoinWorker(existingWorker, ipAddress, runMode, name);
+      return this.rejoinWorker(existingWorker, ipAddress, runMode, name, {
+        encryptionPublicKey,
+        stillRunning,
+      });
     }
 
     // 3. Cloud worker
     if (isCloudKey) {
-      return this.createCloudWorker({ ...metadata, name }, ipAddress, runMode);
+      return this.createCloudWorker(
+        { ...metadata, name },
+        ipAddress,
+        runMode,
+        encryptionPublicKey,
+      );
     }
 
     throw new RpcException('Join key is invalid, expired or already used');
   }
 
-  /** Resumes `existingWorker`: reclaims its jobs and refreshes its details. */
+  /**
+   * Resumes `existingWorker`: requeues the jobs it no longer runs and
+   * refreshes its details.
+   */
   private async rejoinWorker(
     existingWorker: WorkerInstance,
     ipAddress: string | undefined,
     runMode: string | null,
     name: string | undefined,
-    extra?: { joinKeyId?: string },
+    extra?: {
+      joinKeyId?: string;
+      encryptionPublicKey?: string;
+      stillRunning?: string[];
+    },
   ): Promise<WorkerInstance> {
-    await this.fallbackWorkerRejoin(existingWorker.id);
+    await this.fallbackWorkerRejoin(existingWorker.id, extra?.stillRunning ?? []);
     const updates: Record<string, unknown> = {};
     if (ipAddress) {
       updates.ipAddress = ipAddress;
+    }
+    // Registered once (a worker upgraded in place enrolls here). A different
+    // key is never taken: whoever stole the token could swap in their own and
+    // read every job's secrets. A worker that lost its key rejoins with a new
+    // join key instead.
+    const key = extra?.encryptionPublicKey;
+    if (key && !existingWorker.encryptionPublicKey) {
+      updates.encryptionPublicKey = key;
+    } else if (key && key !== existingWorker.encryptionPublicKey) {
+      this.logger.warn(
+        `worker ${existingWorker.id} rejoined with a different encryption key; keeping the registered one`,
+      );
     }
     // The worker reports WORKER_NAME (or its hostname) on every join, so a
     // renamed worker keeps its identity and only its name changes.
@@ -830,7 +894,7 @@ export class WorkersService {
     await this.publishWorkerEvent(
       EVENT_CATALOG.worker.rejoined,
       existingWorker,
-      extra,
+      extra?.joinKeyId ? { joinKeyId: extra.joinKeyId } : undefined,
     );
     return this.repo.findOne({
       where: { id: existingWorker.id },
@@ -847,6 +911,7 @@ export class WorkersService {
     metadata?: WorkerJoinDto['metadata'],
     ipAddress?: string,
     runMode?: string | null,
+    encryptionPublicKey?: string,
   ): Promise<WorkerInstance> {
     const workerId = randomUUID();
     const TOKEN_LENGTH = 48;
@@ -860,6 +925,7 @@ export class WorkersService {
       os: metadata?.os,
       ipAddress,
       runMode: runMode ?? null,
+      encryptionPublicKey: encryptionPublicKey ?? null,
     };
 
     await this.repo.save(data);
@@ -888,6 +954,7 @@ export class WorkersService {
     metadata?: WorkerJoinDto['metadata'],
     ipAddress?: string,
     runMode?: string | null,
+    encryptionPublicKey?: string,
   ): Promise<WorkerInstance> {
     const workerId = randomUUID();
     const TOKEN_LENGTH = 48;
@@ -902,6 +969,7 @@ export class WorkersService {
       os: metadata?.os,
       ipAddress,
       runMode: runMode ?? null,
+      encryptionPublicKey: encryptionPublicKey ?? null,
     };
 
     await this.repo.save(data);
@@ -981,18 +1049,28 @@ export class WorkersService {
   }
 
   /**
-   * Resets all IN_PROGRESS jobs assigned to a specific worker back to PENDING.
-   * Used when a worker rejoins after disconnection to reclaim pending work.
+   * Puts the IN_PROGRESS jobs of a rejoining worker back to PENDING, except
+   * those it reports still running: its session (and those jobs) survived the
+   * reconnect, and requeuing them had another worker run them again while
+   * this one's results were discarded. A worker that reports nothing (older
+   * builds send no list) gets every job requeued, as before.
    * @param workerId - The ID of the worker whose jobs should be reset.
+   * @param stillRunning - Validated job ids the worker reported.
    */
-  private async fallbackWorkerRejoin(workerId: string) {
-    await this.jobsRegistryService.repo
+  private async fallbackWorkerRejoin(workerId: string, stillRunning: string[]) {
+    const query = this.jobRepository
       .createQueryBuilder()
       .update()
       .set({ status: JobStatus.PENDING })
       .where('workerId = :workerId', { workerId })
-      .andWhere('status = :status', { status: JobStatus.IN_PROGRESS })
-      .execute();
+      .andWhere('status = :status', { status: JobStatus.IN_PROGRESS });
+    if (stillRunning.length > 0) {
+      // One array parameter, however long the list.
+      query.andWhere('NOT (id = ANY(:running::uuid[]))', {
+        running: stillRunning,
+      });
+    }
+    await query.execute();
   }
 
   /**

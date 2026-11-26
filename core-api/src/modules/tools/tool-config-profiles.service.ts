@@ -1,13 +1,11 @@
 import {
-  BadRequestException,
-  ConflictException,
   Injectable,
   Logger,
-  NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 
+import { parseCiphertext } from '@/common/utils/encryption.util';
 import { ConnectorRegistryService } from '@/modules/connectors/connector-registry.service';
 import { WorkspaceEncryptionService } from '@/services/workspace-encryption/workspace-encryption.service';
 import { ToolConfigProfile } from './entities/tool-config-profiles.entity';
@@ -21,6 +19,7 @@ import {
   maskProfile,
 } from './validators/tool-config-profiles.crypto';
 import { validateProfileOrThrow } from './validators/tool-config-profiles.validator';
+import { ConflictError, InvalidInputError, NotFoundError } from '@/common/errors/domain.errors';
 
 interface JobRef { id: string; }
 interface WfRef { name: string; wf_id: string; }
@@ -47,11 +46,11 @@ export class ToolConfigProfilesService {
   private async resolveConnectorSchema(toolId: string) {
     const tool = await this.toolsRepo.findOne({ where: { id: toolId } });
     if (!tool) {
-      throw new BadRequestException(`Tool ${toolId} not found`);
+      throw new InvalidInputError(`Tool ${toolId} not found`);
     }
     const entry = this.connectorRegistry.getConnector(tool.name);
     if (!entry) {
-      throw new BadRequestException(
+      throw new InvalidInputError(
         `Unknown tool "${tool.name}" -- cannot validate config`,
       );
     }
@@ -141,7 +140,7 @@ export class ToolConfigProfilesService {
       },
     });
     if (existing) {
-      throw new ConflictException(
+      throw new ConflictError(
         `Profile name "${dto.name}" already exists for this tool`,
       );
     }
@@ -210,7 +209,7 @@ export class ToolConfigProfilesService {
         },
       });
       if (dup) {
-        throw new ConflictException(
+        throw new ConflictError(
           `Profile name "${dto.name}" already exists for this tool`,
         );
       }
@@ -305,7 +304,7 @@ export class ToolConfigProfilesService {
       [profileId, workspaceId],
     )) as unknown as JobRef[];
     if (jobRefs && jobRefs.length > 0) {
-      throw new ConflictException(
+      throw new ConflictError(
         `Cannot delete profile ${profileId}: referenced by Job #${jobRefs[0].id}`,
       );
     }
@@ -319,7 +318,7 @@ export class ToolConfigProfilesService {
       [workspaceId, JSON.stringify([{ configProfileId: profileId }])],
     )) as unknown as WfRef[];
     if (wfRefs && wfRefs.length > 0) {
-      throw new ConflictException(
+      throw new ConflictError(
         `Cannot delete profile ${profileId}: referenced by Workflow ${wfRefs[0].name} (#${wfRefs[0].wf_id})`,
       );
     }
@@ -381,7 +380,7 @@ export class ToolConfigProfilesService {
     const profile = await this.findOwned(workspaceId, profileId);
     const profileToolId = (profile.tool as unknown as { id: string }).id;
     if (profileToolId !== toolId) {
-      throw new BadRequestException(
+      throw new InvalidInputError(
         `Profile ${profileId} does not belong to tool ${toolId}`,
       );
     }
@@ -406,13 +405,13 @@ export class ToolConfigProfilesService {
         relations: ['workspace', 'tool'],
       });
       if (!profile) {
-        throw new NotFoundException(`ToolConfigProfile ${profileId} not found`);
+        throw new NotFoundError(`ToolConfigProfile ${profileId} not found`);
       }
 
       const profileWsId = (profile.workspace as unknown as { id: string }).id;
       const profileToolId = (profile.tool as unknown as { id: string }).id;
       if (profileWsId !== workspaceId || profileToolId !== toolId) {
-        throw new NotFoundException(`ToolConfigProfile ${profileId} not found`);
+        throw new NotFoundError(`ToolConfigProfile ${profileId} not found`);
       }
     } else {
       // Default profile for this workspace + tool
@@ -480,6 +479,31 @@ export class ToolConfigProfilesService {
     return deepMerge(base, inlineConfig);
   }
 
+  /**
+   * Encrypts a job's config for storage on the job row: the connector
+   * schema's sensitive fields go under the workspace DEK, the rest stays
+   * readable. `resolveConfigForJob` decrypts the same fields at dispatch.
+   * Values already encrypted are kept, so sealing twice changes nothing and
+   * the same object comes back when there is nothing to seal.
+   */
+  async sealJobConfig(
+    workspaceId: string,
+    toolName: string,
+    config: Record<string, unknown> | null | undefined,
+  ): Promise<Record<string, unknown> | null> {
+    if (!config) return null;
+    const fields = getSensitiveFields(
+      this.connectorRegistry.getConnector(toolName)?.configSchema,
+    ).filter((field) => {
+      const value = config[field];
+      return typeof value === 'string' && !parseCiphertext(value);
+    });
+    if (fields.length === 0) return config;
+
+    const dek = await this.encryptionService.getDEK(workspaceId);
+    return encryptProfile(config, fields, dek);
+  }
+
   // ── Internals ────────────────────────────────────────────────────────
 
   private async findOwned(
@@ -491,11 +515,11 @@ export class ToolConfigProfilesService {
       relations: ['workspace', 'tool'],
     });
     if (!profile) {
-      throw new NotFoundException(`Profile ${profileId} not found`);
+      throw new NotFoundError(`Profile ${profileId} not found`);
     }
     const profileWsId = (profile.workspace as unknown as { id: string }).id;
     if (profileWsId !== workspaceId) {
-      throw new NotFoundException(`Profile ${profileId} not found`);
+      throw new NotFoundError(`Profile ${profileId} not found`);
     }
     return profile;
   }

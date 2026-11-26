@@ -1,6 +1,7 @@
 import type { UserContextPayload } from '@/common/interfaces/app.interface';
-import { AuditOutcome, IntegrationType } from '@/common/enums/enum';
-import { EventEmitter2 } from '@nestjs/event-emitter';
+import { AuditOutcome, IntegrationType, JobRunType } from '@/common/enums/enum';
+import { NotFoundError } from '@/common/errors/domain.errors';
+import { EVENT_LISTENER_METADATA, EventEmitter2 } from '@nestjs/event-emitter';
 import type { TestingModule } from '@nestjs/testing';
 import { Test } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
@@ -13,6 +14,7 @@ import type { AuditContext } from '../audit/audit.service';
 import { AuditService } from '../audit/audit.service';
 import { EventBridgeService } from '../event-bridge/publishing/event-bridge.service';
 import { Integration } from '../integrations/entities/integration.entity';
+import { WORKSPACE_DELETING_EVENT } from '../workspaces/workspace.events';
 import { WorkspacesService } from '../workspaces/workspaces.service';
 import {
   Target,
@@ -121,6 +123,149 @@ describe('TargetsService', () => {
 
   it('should be defined', () => {
     expect(service).toBeDefined();
+  });
+
+  describe('reScan', () => {
+    const targetId = 'target-uuid';
+    const target = (overrides: Partial<Target>) =>
+      ({
+        id: targetId,
+        workspaceId: 'workspace-uuid',
+        reScanCount: 0,
+        value: 'example.com',
+        ...overrides,
+      }) as Target;
+
+    beforeEach(() => {
+      mockAssetsService.hasPrimaryAsset = jest.fn().mockResolvedValue(true);
+      mockTargetRepository.update = jest.fn().mockResolvedValue({});
+    });
+
+    it('counts the re-scan and announces it with the type of the target', async () => {
+      const domain = target({ type: TargetType.DOMAIN });
+      mockTargetRepository.findOne = jest.fn().mockResolvedValue(domain);
+
+      const result = await service.reScan(targetId, 'workspace-uuid');
+
+      expect(result).toEqual({ message: 'Scan started' });
+      expect(mockTargetRepository.findOne).toHaveBeenCalledWith({
+        where: { id: targetId, workspaceId: 'workspace-uuid' },
+      });
+      expect(mockAssetsService.hasPrimaryAsset).toHaveBeenCalledWith(targetId);
+      expect(mockTargetRepository.update).toHaveBeenCalledWith(targetId, {
+        reScanCount: 1,
+        lastDiscoveredAt: expect.any(Date) as Date,
+      });
+      expect(mockEventEmitter.emit).toHaveBeenCalledWith(
+        'target.domain.re-scan',
+        domain,
+        { jobRunType: JobRunType.MANUAL },
+      );
+    });
+
+    it('emits the re-scan trigger of the target type (IP runs IP discovery, not domain discovery)', async () => {
+      const ip = target({ type: TargetType.IP, value: '203.0.113.10', reScanCount: 2 });
+      mockTargetRepository.findOne = jest.fn().mockResolvedValue(ip);
+
+      await service.reScan(targetId, 'workspace-uuid');
+
+      expect(mockEventEmitter.emit).toHaveBeenCalledWith('target.ip.re-scan', ip, {
+        jobRunType: JobRunType.MANUAL,
+      });
+    });
+
+    it('passes the scheduled run type on to the workflow trigger', async () => {
+      const domain = target({ type: TargetType.DOMAIN });
+      mockTargetRepository.findOne = jest.fn().mockResolvedValue(domain);
+
+      await service.reScan(targetId, 'workspace-uuid', JobRunType.SCHEDULED);
+
+      expect(mockEventEmitter.emit).toHaveBeenCalledWith(
+        'target.domain.re-scan',
+        domain,
+        { jobRunType: JobRunType.SCHEDULED },
+      );
+    });
+
+    it('re-syncs a Git organization instead of requiring a primary host asset', async () => {
+      const org = target({ type: TargetType.GIT_ORG, value: 'github.com/acme' });
+      mockTargetRepository.findOne = jest.fn().mockResolvedValue(org);
+
+      const result = await service.reScan(targetId, 'workspace-uuid');
+
+      expect(result).toEqual({ message: 'Repository sync started' });
+      expect(mockAssetsService.hasPrimaryAsset).not.toHaveBeenCalled();
+      expect(mockTargetRepository.update).toHaveBeenCalledWith(targetId, {
+        reScanCount: 1,
+      });
+      expect(mockEventEmitter.emit).toHaveBeenCalledWith('target.git_org.re-scan', org);
+    });
+
+    it('refuses a target of another workspace', async () => {
+      mockTargetRepository.findOne = jest.fn().mockResolvedValue(null);
+
+      await expect(service.reScan(targetId, 'other-workspace')).rejects.toThrow(
+        new NotFoundError('Target not found'),
+      );
+      expect(mockEventEmitter.emit).not.toHaveBeenCalled();
+    });
+
+    it('refuses a host target whose primary asset is gone', async () => {
+      mockTargetRepository.findOne = jest
+        .fn()
+        .mockResolvedValue(target({ type: TargetType.DOMAIN }));
+      mockAssetsService.hasPrimaryAsset = jest.fn().mockResolvedValue(false);
+
+      await expect(service.reScan(targetId, 'workspace-uuid')).rejects.toThrow(
+        new NotFoundError('Asset not found'),
+      );
+      expect(mockTargetRepository.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('a workspace being deleted', () => {
+    it('removes the targets of that workspace', async () => {
+      mockTargetRepository.delete = jest.fn().mockResolvedValue({ affected: 3 });
+
+      await service.onWorkspaceDeleting({ workspaceId: 'ws-1' });
+
+      expect(mockTargetRepository.delete).toHaveBeenCalledWith({ workspaceId: 'ws-1' });
+    });
+
+    it('is awaited by the deletion, which fails when it does', () => {
+      expect(
+        Reflect.getMetadata(
+          EVENT_LISTENER_METADATA,
+          TargetsService.prototype.onWorkspaceDeleting,
+        ),
+      ).toEqual([
+        {
+          event: WORKSPACE_DELETING_EVENT,
+          options: { promisify: true, suppressErrors: false },
+        },
+      ]);
+    });
+  });
+
+  describe('findInWorkspace / markDiscovered', () => {
+    it('finds a target only inside its workspace', async () => {
+      mockTargetRepository.findOne = jest.fn().mockResolvedValue(null);
+
+      await expect(service.findInWorkspace('t-1', 'ws-1')).resolves.toBeNull();
+      expect(mockTargetRepository.findOne).toHaveBeenCalledWith({
+        where: { id: 't-1', workspaceId: 'ws-1' },
+      });
+    });
+
+    it('stamps the time of the latest discovery', async () => {
+      mockTargetRepository.update = jest.fn().mockResolvedValue({});
+
+      await service.markDiscovered('t-1');
+
+      expect(mockTargetRepository.update).toHaveBeenCalledWith('t-1', {
+        lastDiscoveredAt: expect.any(Date) as Date,
+      });
+    });
   });
 
   describe('createMultipleTargets', () => {
@@ -1424,6 +1569,7 @@ describe('TargetsService', () => {
     it('getTargetsInWorkspace select should include targets.source', async () => {
       // Arrange
       const builder = baseBuilder();
+      builder.getRawMany.mockResolvedValue([{ id: 't-1' }]);
       (mockTargetRepository.createQueryBuilder as jest.Mock).mockReturnValue(
         builder,
       );
@@ -1439,6 +1585,97 @@ describe('TargetsService', () => {
         expect.arrayContaining(['targets.source as "source"']),
       );
       expect(builder.groupBy).toHaveBeenCalledWith('targets.id');
+    });
+
+    it('getTargetsInWorkspace matches value case-insensitively with an escaped pattern', async () => {
+      const builder = baseBuilder();
+      (mockTargetRepository.createQueryBuilder as jest.Mock).mockReturnValue(
+        builder,
+      );
+
+      await service.getTargetsInWorkspace(
+        { page: 1, limit: 10, value: 'Acme_1%' } as never,
+        'ws-1',
+      );
+
+      expect(builder.andWhere).toHaveBeenCalledWith(
+        'targets.value ILIKE :value',
+        { value: '%Acme\\_1\\%%' },
+      );
+    });
+
+    it('getTargetsInWorkspace does not join workspace members (it only multiplied rows)', async () => {
+      const builder = baseBuilder();
+      (mockTargetRepository.createQueryBuilder as jest.Mock).mockReturnValue(
+        builder,
+      );
+
+      await service.getTargetsInWorkspace({ page: 1, limit: 10 } as never, 'ws-1');
+
+      const joins = builder.innerJoin.mock.calls.map(([rel]) => rel as string);
+      expect(joins).not.toContain('workspace.workspaceMembers');
+    });
+
+    it('getTargetsInWorkspace picks the page of ids first and aggregates only those', async () => {
+      const builder = baseBuilder();
+      builder.getCount.mockResolvedValue(12);
+      builder.getRawMany
+        .mockResolvedValueOnce([{ id: 't-1' }, { id: 't-2' }])
+        .mockResolvedValueOnce([
+          { id: 't-1', value: 'a.com', source: 'MANUAL', type: 'DOMAIN' },
+          { id: 't-2', value: 'b.com', source: 'MANUAL', type: 'DOMAIN' },
+        ]);
+      (mockTargetRepository.createQueryBuilder as jest.Mock).mockReturnValue(
+        builder,
+      );
+
+      const result = await service.getTargetsInWorkspace(
+        { page: 2, limit: 2 } as never,
+        'ws-1',
+      );
+
+      expect(builder.limit).toHaveBeenCalledWith(2);
+      expect(builder.offset).toHaveBeenCalledWith(2);
+      expect(builder.andWhere).toHaveBeenCalledWith('targets.id IN (:...pageIds)', {
+        pageIds: ['t-1', 't-2'],
+      });
+      expect(builder.having).not.toHaveBeenCalled();
+      expect(result.total).toBe(12);
+      expect(result.data.map((t) => t.id)).toEqual(['t-1', 't-2']);
+    });
+
+    it('getTargetsInWorkspace skips the aggregate query when the page is empty', async () => {
+      const builder = baseBuilder();
+      (mockTargetRepository.createQueryBuilder as jest.Mock).mockReturnValue(
+        builder,
+      );
+
+      const result = await service.getTargetsInWorkspace(
+        { page: 1, limit: 10, value: 'zzqx' } as never,
+        'ws-1',
+      );
+
+      expect(builder.getRawMany).toHaveBeenCalledTimes(1);
+      expect(builder.groupBy).not.toHaveBeenCalled();
+      expect(result.data).toEqual([]);
+    });
+
+    it('getTargetsInWorkspace keeps the aggregate-first path for a status filter', async () => {
+      const builder = baseBuilder();
+      (mockTargetRepository.createQueryBuilder as jest.Mock).mockReturnValue(
+        builder,
+      );
+
+      await service.getTargetsInWorkspace(
+        { page: 1, limit: 10, status: 'pending' } as never,
+        'ws-1',
+      );
+
+      expect(builder.having).toHaveBeenCalled();
+      expect(builder.andWhere).not.toHaveBeenCalledWith(
+        'targets.id IN (:...pageIds)',
+        expect.anything(),
+      );
     });
 
     it('getTargetsInWorkspace maps a MANUAL raw source to {source: "Manual", icon: ""}', async () => {

@@ -1,10 +1,10 @@
 {
   "name": "core-api",
-  "version": "0.12.2",
+  "version": "0.13.0",
   "description": "",
   "author": "oasm-platform",
   "private": true,
-  "license": "GPL-3.0-only",
+  "license": "AGPL-3.0-only",
   "scripts": {
     "build": "nest build",
     "typeorm": "typeorm-ts-node-commonjs -r tsconfig-paths/register",
@@ -42,6 +42,7 @@
     "@aws-sdk/s3-request-presigner": "^3.1048.0",
     "@grpc/grpc-js": "^1.14.5",
     "@grpc/reflection": "^1.0.4",
+    "@hpke/core": "^1.10.1",
     "@modelcontextprotocol/sdk": "^1.31.0",
     "@nestjs/axios": "^12.0.1",
     "@nestjs/bullmq": "^12.0.0",
@@ -133,15 +134,24 @@
       ]
     },
     "collectCoverageFrom": [
-      "**/*.(t|j)s"
+      "**/*.(t|j)s",
+      "!database/migrations/**"
     ],
     "coverageDirectory": "../coverage",
+    "coverageThreshold": {
+      "global": {
+        "statements": 68,
+        "branches": 63,
+        "functions": 66,
+        "lines": 69
+      }
+    },
     "testEnvironment": "node",
     "moduleNameMapper": {
       "^@/(.*)$": "<rootDir>/$1"
     },
     "transformIgnorePatterns": [
-      "node_modules/(?!(?:\\.pnpm/[^/]+/node_modules/)?(better-auth|@react-pdf|react|react-dom|@nestjs|@standard-schema|file-type|load-esm|uid|ai|@ai-sdk|@workflow|eventsource-parser)/)"
+      "node_modules/(?!(?:\\.pnpm/[^/]+/node_modules/)?(better-auth|@react-pdf|react|react-dom|@nestjs|@standard-schema|file-type|load-esm|uid|ai|@ai-sdk|@workflow|eventsource-parser|intl-messageformat|@formatjs)/)"
     ]
   }
 }

@@ -1,17 +1,46 @@
 import { WorkspacePermissions } from '@/common/decorators/workspace-permissions.decorator';
-import { ToolCategory } from '@/common/enums/enum';
+import {
+  ToolCategory,
+  WorkerScope,
+  WorkerType,
+} from '@/common/enums/enum';
 import { GrpcWorkerContext } from '@/common/guards/grpc-worker-context.service';
+import { Metadata } from '@grpc/grpc-js';
+import {
+  Aes256Gcm,
+  CipherSuite,
+  DhkemP256HkdfSha256,
+  HkdfSha256,
+} from '@hpke/core';
 import { Reflector } from '@nestjs/core';
 import type { TestingModule } from '@nestjs/testing';
 import { Test } from '@nestjs/testing';
 import { ConnectorRegistryService } from '../connectors/connector-registry.service';
-import { IntegrationsService } from '../integrations/integrations.service';
+import { EventBridgeService } from '../event-bridge/publishing/event-bridge.service';
+import { IntegrationConfigReader } from '../integrations/integration-config.reader';
 import { ToolConfigProfilesService } from '../tools/tool-config-profiles.service';
+import type { WorkerInstance } from '../workers/entities/worker.entity';
 import { WorkersService } from '../workers/workers.service';
 import { WorkspacesService } from '../workspaces/workspaces.service';
 import { JobsRegistryController } from './jobs-registry.controller';
+import { JobsRegistryGrpcController } from './jobs-registry.grpc.controller';
+import { JobDispatchService } from './job-dispatch.service';
+import { JobHistoryQueryService } from './job-history-query.service';
 import { JobsRegistryService } from './jobs-registry.service';
 import { WorkflowRunnerService } from './workflow-runner.service';
+
+/** The worker GrpcWorkerTokenGuard / WorkerTokenGuard authenticated. */
+let authedWorker: WorkerInstance;
+const metadata = new Metadata();
+
+beforeEach(() => {
+  authedWorker = {
+    id: 'worker-1',
+    type: WorkerType.BUILT_IN,
+    scope: WorkerScope.WORKSPACE,
+    workspaceId: 'ws-1',
+  } as WorkerInstance;
+});
 
 describe('JobsRegistryController', () => {
   // ── Existing decorator tests ────────────────────────────────────────
@@ -59,15 +88,18 @@ describe('JobsRegistryController', () => {
   // ── Task 4.3: gRPC Next handler ─────────────────────────────────────
 
   describe('next (gRPC)', () => {
-    let controller: JobsRegistryController;
+    let grpc: JobsRegistryGrpcController;
     let mockJobsRegistryService: any;
     let mockConnectorRegistry: any;
     let mockToolConfigProfilesService: any;
-    let mockIntegrationsService: { getIntegrationWithDecryptedConfig: jest.Mock };
+    let mockIntegrationConfig: { getIntegrationWithDecryptedConfig: jest.Mock };
+    let eventBridge: { publishSafely: jest.Mock };
 
     beforeEach(async () => {
       mockJobsRegistryService = {
         getNextJob: jest.fn(),
+        getNextJobs: jest.fn(),
+        failUndispatchableJob: jest.fn(),
       };
       mockConnectorRegistry = {
         getConnector: jest.fn(),
@@ -80,31 +112,37 @@ describe('JobsRegistryController', () => {
       mockToolConfigProfilesService = {
         resolveConfigForJob: jest.fn(),
       };
-      mockIntegrationsService = {
+      mockIntegrationConfig = {
         getIntegrationWithDecryptedConfig: jest.fn(),
       };
 
       const module: TestingModule = await Test.createTestingModule({
-        controllers: [JobsRegistryController],
+        controllers: [JobsRegistryController, JobsRegistryGrpcController],
         providers: [
           { provide: JobsRegistryService, useValue: mockJobsRegistryService },
+          { provide: JobHistoryQueryService, useValue: {} },
+          // One bag of mocks: getNextJob(s) on the dispatch side, the rest on the registry
+          { provide: JobDispatchService, useValue: mockJobsRegistryService },
           { provide: ConnectorRegistryService, useValue: mockConnectorRegistry },
           { provide: ToolConfigProfilesService, useValue: mockToolConfigProfilesService },
-          { provide: IntegrationsService, useValue: mockIntegrationsService },
+          { provide: IntegrationConfigReader, useValue: mockIntegrationConfig },
           { provide: WorkflowRunnerService, useValue: { retryRun: jest.fn() } },
           { provide: WorkspacesService, useValue: { getWorkspace: jest.fn() } },
           { provide: WorkersService, useValue: { validateWorkerToken: jest.fn() } },
-          { provide: GrpcWorkerContext, useValue: { setWorker: jest.fn() } },
+          { provide: GrpcWorkerContext, useValue: { requireWorker: () => authedWorker } },
+          { provide: EventBridgeService, useValue: { publishSafely: jest.fn() } },
         ],
       }).compile();
 
-      controller = module.get(JobsRegistryController);
+
+      grpc = module.get(JobsRegistryGrpcController);
+      eventBridge = module.get(EventBridgeService);
     });
 
     it('should return empty stub when no job found', async () => {
       mockJobsRegistryService.getNextJob.mockResolvedValue(null);
 
-      const result = await controller.next({ id: 'worker-1' });
+      const result = await grpc.next({ id: 'worker-1' }, metadata);
 
       expect(result).toEqual({ id: '', asset: {}, command: '' });
     });
@@ -131,7 +169,7 @@ describe('JobsRegistryController', () => {
       });
       mockToolConfigProfilesService.resolveConfigForJob.mockResolvedValue({});
 
-      const result = await controller.next({ id: 'worker-1' });
+      const result = await grpc.next({ id: 'worker-1' }, metadata);
 
       // Lookup still keys off the persisted tool name...
       expect(mockConnectorRegistry.getConnector).toHaveBeenCalledWith(
@@ -170,9 +208,33 @@ describe('JobsRegistryController', () => {
       });
       mockToolConfigProfilesService.resolveConfigForJob.mockResolvedValue({});
 
-      const result = await controller.next({ id: 'worker-1' });
+      const result = await grpc.next({ id: 'worker-1' }, metadata);
 
       expect(result.directEgress).toBe(true);
+      // Only manifests that declare it keep the config out of the env.
+      expect(result.configInband).toBe(false);
+    });
+
+    it('tells the worker the job workspace and whether the connector reads its config in-band', async () => {
+      mockJobsRegistryService.getNextJob.mockResolvedValue({
+        id: 'job-ws',
+        workspaceId: 'ws-1',
+        category: 'vulnerabilities',
+        asset: { value: 'example.com' },
+        config: null,
+        tool: { id: 'nuclei', name: 'nuclei' },
+      });
+      mockConnectorRegistry.getConnector.mockReturnValue({
+        slug: 'nuclei',
+        image: 'ghcr.io/oasm-platform/connector-nuclei:3',
+        configInband: true,
+      });
+      mockToolConfigProfilesService.resolveConfigForJob.mockResolvedValue({});
+
+      const result = await grpc.next({ id: 'worker-1' }, metadata);
+
+      expect(result.workspaceId).toBe('ws-1');
+      expect(result.configInband).toBe(true);
     });
 
     it('sends the inputs a job was planned with, e.g. the URL of a web service', async () => {
@@ -192,7 +254,7 @@ describe('JobsRegistryController', () => {
       });
       mockToolConfigProfilesService.resolveConfigForJob.mockResolvedValue({});
 
-      const result = await controller.next({ id: 'worker-1' });
+      const result = await grpc.next({ id: 'worker-1' }, metadata);
 
       expect(result.inputs).toEqual({
         fields: { target: { stringValue: 'https://app.example.com:8443' } },
@@ -218,15 +280,15 @@ describe('JobsRegistryController', () => {
         image: 'ghcr.io/oasm-platform/connector-gitleaks:8',
       });
       mockToolConfigProfilesService.resolveConfigForJob.mockResolvedValue({});
-      mockIntegrationsService.getIntegrationWithDecryptedConfig.mockResolvedValue({
+      mockIntegrationConfig.getIntegrationWithDecryptedConfig.mockResolvedValue({
         integration: { appType: 'gitlab' },
         decryptedConfig: { apiToken: 'glpat-secret' },
       });
 
-      const result = await controller.next({ id: 'worker-1' });
+      const result = await grpc.next({ id: 'worker-1' }, metadata);
 
       expect(
-        mockIntegrationsService.getIntegrationWithDecryptedConfig,
+        mockIntegrationConfig.getIntegrationWithDecryptedConfig,
       ).toHaveBeenCalledWith('int-1', 'ws-1');
       expect(result.inputs).toEqual({
         fields: {
@@ -256,11 +318,11 @@ describe('JobsRegistryController', () => {
         image: 'ghcr.io/oasm-platform/connector-gitleaks:8',
       });
       mockToolConfigProfilesService.resolveConfigForJob.mockResolvedValue({});
-      mockIntegrationsService.getIntegrationWithDecryptedConfig.mockRejectedValue(
+      mockIntegrationConfig.getIntegrationWithDecryptedConfig.mockRejectedValue(
         new Error('not found'),
       );
 
-      const result = await controller.next({ id: 'worker-1' });
+      const result = await grpc.next({ id: 'worker-1' }, metadata);
 
       expect(result.inputs).toEqual({
         fields: {
@@ -270,12 +332,202 @@ describe('JobsRegistryController', () => {
       });
     });
 
+    // ── Worker identity and secret release ──
+
+    const connectorJob = (overrides: Record<string, unknown> = {}) => ({
+      id: 'job-9',
+      workspaceId: 'ws-1',
+      category: 'vulnerabilities',
+      asset: { value: 'example.com' },
+      config: null,
+      tool: { id: 'tool-nessus', name: 'nessus' },
+      ...overrides,
+    });
+
+    const useNessusConnector = (): void => {
+      mockConnectorRegistry.getConnector.mockReturnValue({
+        slug: 'nessus',
+        image: 'ghcr.io/oasm-platform/connector-nessus:1',
+        configSchema: {
+          properties: { apiKey: { type: 'string' }, rate: { type: 'number' } },
+        },
+      });
+    };
+
+    it('claims as the authenticated worker, not the worker id in the request', async () => {
+      mockJobsRegistryService.getNextJob.mockResolvedValue(null);
+
+      await grpc.next({ id: 'someone-elses-worker' }, metadata);
+
+      expect(mockJobsRegistryService.getNextJob).toHaveBeenCalledWith('worker-1');
+    });
+
+    it('batch-claims as the authenticated worker', async () => {
+      mockJobsRegistryService.getNextJobs.mockResolvedValue([]);
+
+      await grpc.nextBatch({ id: 'someone-elses-worker', limit: 3 }, metadata);
+
+      expect(mockJobsRegistryService.getNextJobs).toHaveBeenCalledWith(
+        'worker-1',
+        3,
+      );
+    });
+
+    it('resolves a config the whole batch shares once, and each different one apart', async () => {
+      // Given: three jobs of one step and one job on another profile
+      useNessusConnector();
+      mockJobsRegistryService.getNextJobs.mockResolvedValue([
+        connectorJob({ id: 'job-1', configProfileId: 'profile-a' }),
+        connectorJob({ id: 'job-2', configProfileId: 'profile-a' }),
+        connectorJob({ id: 'job-3', configProfileId: 'profile-a' }),
+        connectorJob({ id: 'job-4', configProfileId: 'profile-b' }),
+      ]);
+      mockToolConfigProfilesService.resolveConfigForJob.mockImplementation(
+        (_ws: string, _tool: string, { configProfileId }: { configProfileId?: string }) =>
+          Promise.resolve({ apiKey: `key-${configProfileId}` }),
+      );
+
+      // When
+      const { values } = await grpc.nextBatch({ id: 'worker-1', limit: 4 }, metadata);
+
+      // Then: one decrypt per distinct config, every job still gets its own
+      expect(mockToolConfigProfilesService.resolveConfigForJob).toHaveBeenCalledTimes(2);
+      expect(values.map((job) => JSON.stringify(job.config))).toEqual([
+        expect.stringContaining('key-profile-a'),
+        expect.stringContaining('key-profile-a'),
+        expect.stringContaining('key-profile-a'),
+        expect.stringContaining('key-profile-b'),
+      ]);
+    });
+
+    it('resolves the config again on the next claim', async () => {
+      // Given: the same job shape claimed twice
+      useNessusConnector();
+      mockJobsRegistryService.getNextJobs.mockResolvedValue([
+        connectorJob({ id: 'job-1', configProfileId: 'profile-a' }),
+      ]);
+      mockToolConfigProfilesService.resolveConfigForJob.mockResolvedValue({ apiKey: 'k' });
+
+      // When
+      await grpc.nextBatch({ id: 'worker-1', limit: 1 }, metadata);
+      await grpc.nextBatch({ id: 'worker-1', limit: 1 }, metadata);
+
+      // Then: decrypted values never outlive the call that needed them
+      expect(mockToolConfigProfilesService.resolveConfigForJob).toHaveBeenCalledTimes(2);
+    });
+
+    it('fails a claimed job the worker may not receive the secrets of, without decrypting them', async () => {
+      useNessusConnector();
+      mockJobsRegistryService.getNextJobs.mockResolvedValue([
+        connectorJob({ workspaceId: 'ws-2' }),
+        connectorJob({ id: 'job-10' }),
+      ]);
+      mockToolConfigProfilesService.resolveConfigForJob.mockResolvedValue({});
+
+      const { values } = await grpc.nextBatch(
+        { id: 'worker-1', limit: 2 },
+        metadata,
+      );
+
+      expect(values.map((job) => job.id)).toEqual(['job-10']);
+      expect(mockJobsRegistryService.failUndispatchableJob).toHaveBeenCalledWith(
+        'job-9',
+        expect.stringMatching(/another workspace/),
+      );
+      expect(
+        mockToolConfigProfilesService.resolveConfigForJob,
+      ).toHaveBeenCalledTimes(1);
+    });
+
+    it('hands secrets to the worker without writing an audit event per job', async () => {
+      // Given: a connector job whose config carries a secret
+      useNessusConnector();
+      mockJobsRegistryService.getNextJob.mockResolvedValue(connectorJob());
+      mockToolConfigProfilesService.resolveConfigForJob.mockResolvedValue({
+        apiKey: 'nessus-key',
+        rate: 5,
+      });
+
+      // When
+      const job = await grpc.next({ id: 'worker-1' }, metadata);
+
+      // Then: the job is dispatched with its config, and nothing is published
+      expect(job.id).toBe('job-9');
+      expect(JSON.stringify(job)).toContain('nessus-key');
+      expect(eventBridge.publishSafely).not.toHaveBeenCalled();
+    });
+
+    it('seals the config and repository token to a worker that registered a key, sending neither in the clear', async () => {
+      // The Go worker's sealing fixture: open with its private key below.
+      authedWorker.encryptionPublicKey = Buffer.from(
+        '048f2c1839582ec03f19e8d7c573e64ee1b4d53a6f89647491e3ecc54fbe5623cdce67bd25f51b6a46593576ebdfef573b5f4e95cb4ca8874de3e7b413037fd712',
+        'hex',
+      ).toString('base64');
+      useNessusConnector();
+      mockJobsRegistryService.getNextJob.mockResolvedValue(
+        connectorJob({
+          asset: {
+            value: 'github.com/acme/web',
+            metadata: { url: 'https://github.com/acme/web', defaultBranch: 'main' },
+            target: { type: 'GIT_ORG', integrationId: 'int-1' },
+          },
+        }),
+      );
+      mockToolConfigProfilesService.resolveConfigForJob.mockResolvedValue({ apiKey: 'nessus-key' });
+      mockIntegrationConfig.getIntegrationWithDecryptedConfig.mockResolvedValue({
+        integration: { appType: 'github' },
+        decryptedConfig: { apiToken: 'ghp-secret' },
+      });
+
+      const result = await grpc.next({ id: 'worker-1' }, metadata);
+
+      expect(JSON.stringify(result)).not.toMatch(/nessus-key|ghp-secret/);
+      expect(result.config).toBeUndefined();
+      expect(Object.keys((result.inputs as { fields: object }).fields)).toEqual([
+        'repository',
+        'ref',
+      ]);
+      const sealed = result.sealed as { enc: Buffer; ciphertext: Buffer };
+      const suite = new CipherSuite({
+        kem: new DhkemP256HkdfSha256(),
+        kdf: new HkdfSha256(),
+        aead: new Aes256Gcm(),
+      });
+      const recipient = await suite.createRecipientContext({
+        recipientKey: await suite.kem.deserializePrivateKey(
+          Buffer.from('7585c485a1a72bc3b66395caaa37a1940848a5acba85dfff49a0a2b446792360', 'hex'),
+        ),
+        enc: sealed.enc,
+        info: new TextEncoder().encode('oasm job secrets v1'),
+      });
+      const opened = await recipient.open(
+        sealed.ciphertext,
+        new TextEncoder().encode('job-9|worker-1'),
+      );
+      expect(JSON.parse(new TextDecoder().decode(opened))).toEqual({
+        config: { apiKey: 'nessus-key' },
+        inputs: { username: 'x-access-token', token: 'ghp-secret' },
+      });
+    });
+
+    it('records nothing for a job that carries no secret', async () => {
+      useNessusConnector();
+      mockJobsRegistryService.getNextJob.mockResolvedValue(connectorJob());
+      mockToolConfigProfilesService.resolveConfigForJob.mockResolvedValue({
+        rate: 5,
+      });
+
+      await grpc.next({ id: 'worker-1' }, metadata);
+
+      expect(eventBridge.publishSafely).not.toHaveBeenCalled();
+    });
   });
 
   // ── url_discovery: REST + gRPC delegation ───────────────────────────
 
   describe('url-discovery result endpoints', () => {
     let controller: JobsRegistryController;
+    let grpc: JobsRegistryGrpcController;
     let mockJobsRegistryService: any;
 
     beforeEach(async () => {
@@ -288,15 +540,18 @@ describe('JobsRegistryController', () => {
       };
 
       const module: TestingModule = await Test.createTestingModule({
-        controllers: [JobsRegistryController],
+        controllers: [JobsRegistryController, JobsRegistryGrpcController],
         providers: [
           { provide: JobsRegistryService, useValue: mockJobsRegistryService },
+          { provide: JobHistoryQueryService, useValue: {} },
+          // One bag of mocks: getNextJob(s) on the dispatch side, the rest on the registry
+          { provide: JobDispatchService, useValue: mockJobsRegistryService },
           {
             provide: ConnectorRegistryService,
             useValue: { getConnector: jest.fn(), getResourceDefaults: jest.fn() },
           },
           {
-            provide: IntegrationsService,
+            provide: IntegrationConfigReader,
             useValue: { getIntegrationWithDecryptedConfig: jest.fn() },
           },
           {
@@ -306,11 +561,14 @@ describe('JobsRegistryController', () => {
           { provide: WorkflowRunnerService, useValue: { retryRun: jest.fn() } },
           { provide: WorkspacesService, useValue: { getWorkspace: jest.fn() } },
           { provide: WorkersService, useValue: { validateWorkerToken: jest.fn() } },
-          { provide: GrpcWorkerContext, useValue: { setWorker: jest.fn() } },
+          { provide: GrpcWorkerContext, useValue: { requireWorker: () => authedWorker } },
+          { provide: EventBridgeService, useValue: { publishSafely: jest.fn() } },
         ],
       }).compile();
 
       controller = module.get(JobsRegistryController);
+
+      grpc = module.get(JobsRegistryGrpcController);
     });
 
     it('S1 REST: POST :workerId/result/url-discovery delegates with ToolCategory.URL_DISCOVERY', async () => {
@@ -321,8 +579,9 @@ describe('JobsRegistryController', () => {
       } as any;
 
       const result = await controller.updateUrlDiscoveryResult(
-        { workerId: 'worker-uuid' },
+        { workerId: 'worker-1' },
         dto,
+        authedWorker,
       );
 
       expect(mockJobsRegistryService.updateResultByCategory).toHaveBeenCalledTimes(
@@ -330,7 +589,7 @@ describe('JobsRegistryController', () => {
       );
       const [workerId, passedDto, category] =
         mockJobsRegistryService.updateResultByCategory.mock.calls[0];
-      expect(workerId).toBe('worker-uuid');
+      expect(workerId).toBe('worker-1');
       expect(passedDto).toBe(dto);
       expect(category).toBe(ToolCategory.URL_DISCOVERY);
       expect(result).toEqual({ jobId: 'bull-job-id', queueId: 'job-result' });
@@ -342,13 +601,16 @@ describe('JobsRegistryController', () => {
         { url: 'https://b.example.com' },
       ];
 
-      const result = await controller.resultUrlDiscovery({
-        workerId: 'worker-uuid',
-        jobId: 'job-uuid',
-        error: false,
-        raw: 'raw-out',
-        urls,
-      });
+      const result = await grpc.resultUrlDiscovery(
+        {
+          workerId: 'worker-1',
+          jobId: 'job-uuid',
+          error: false,
+          raw: 'raw-out',
+          urls,
+        },
+        metadata,
+      );
 
       expect(mockJobsRegistryService.updateResultByCategory).toHaveBeenCalledTimes(
         1,
@@ -362,12 +624,36 @@ describe('JobsRegistryController', () => {
       expect(result).toEqual({ success: true });
     });
 
+    it('submits gRPC results as the authenticated worker, not the worker id in the request', async () => {
+      await grpc.resultSubdomains(
+        { workerId: 'someone-elses-worker', jobId: 'job-uuid', error: false },
+        metadata,
+      );
+
+      const [workerId] =
+        mockJobsRegistryService.updateResultByCategory.mock.calls[0];
+      expect(workerId).toBe('worker-1');
+    });
+
+    it('submits HTTP results as the authenticated worker, not the :workerId path param', async () => {
+      const dto = { jobId: 'job-uuid', error: false, payload: [] } as any;
+
+      await controller.updateSubdomainResult(
+        { workerId: 'someone-elses-worker' },
+        dto,
+        authedWorker,
+      );
+
+      const [workerId] =
+        mockJobsRegistryService.updateResultByCategory.mock.calls[0];
+      expect(workerId).toBe('worker-1');
+    });
+
     it('S2 edge: urls undefined → payload [] (no throw)', async () => {
-      const result = await controller.resultUrlDiscovery({
-        workerId: 'worker-uuid',
-        jobId: 'job-uuid',
-        error: false,
-      });
+      const result = await grpc.resultUrlDiscovery(
+        { workerId: 'worker-1', jobId: 'job-uuid', error: false },
+        metadata,
+      );
 
       const [, passedDto] =
         mockJobsRegistryService.updateResultByCategory.mock.calls[0];
@@ -378,7 +664,11 @@ describe('JobsRegistryController', () => {
     it('S3 regression: updatePortsResult still delegates with PORTS_SCANNER', async () => {
       const dto = { jobId: 'job-uuid', error: false, payload: [80, 443] } as any;
 
-      await controller.updatePortsResult({ workerId: 'worker-uuid' }, dto);
+      await controller.updatePortsResult(
+        { workerId: 'worker-1' },
+        dto,
+        authedWorker,
+      );
 
       const [, passedDto, category] =
         mockJobsRegistryService.updateResultByCategory.mock.calls[0];
@@ -390,7 +680,7 @@ describe('JobsRegistryController', () => {
   // ── vulnerability result: severity case normalization at gRPC boundary ──
 
   describe('vulnerability result endpoints', () => {
-    let controller: JobsRegistryController;
+    let grpc: JobsRegistryGrpcController;
     let mockJobsRegistryService: any;
 
     beforeEach(async () => {
@@ -402,15 +692,18 @@ describe('JobsRegistryController', () => {
       };
 
       const module: TestingModule = await Test.createTestingModule({
-        controllers: [JobsRegistryController],
+        controllers: [JobsRegistryController, JobsRegistryGrpcController],
         providers: [
           { provide: JobsRegistryService, useValue: mockJobsRegistryService },
+          { provide: JobHistoryQueryService, useValue: {} },
+          // One bag of mocks: getNextJob(s) on the dispatch side, the rest on the registry
+          { provide: JobDispatchService, useValue: mockJobsRegistryService },
           {
             provide: ConnectorRegistryService,
             useValue: { getConnector: jest.fn(), getResourceDefaults: jest.fn() },
           },
           {
-            provide: IntegrationsService,
+            provide: IntegrationConfigReader,
             useValue: { getIntegrationWithDecryptedConfig: jest.fn() },
           },
           {
@@ -420,11 +713,13 @@ describe('JobsRegistryController', () => {
           { provide: WorkflowRunnerService, useValue: { retryRun: jest.fn() } },
           { provide: WorkspacesService, useValue: { getWorkspace: jest.fn() } },
           { provide: WorkersService, useValue: { validateWorkerToken: jest.fn() } },
-          { provide: GrpcWorkerContext, useValue: { setWorker: jest.fn() } },
+          { provide: GrpcWorkerContext, useValue: { requireWorker: () => authedWorker } },
+          { provide: EventBridgeService, useValue: { publishSafely: jest.fn() } },
         ],
       }).compile();
 
-      controller = module.get(JobsRegistryController);
+
+      grpc = module.get(JobsRegistryGrpcController);
     });
 
     it('lowercases proto enum severity names before persisting', async () => {
@@ -436,12 +731,10 @@ describe('JobsRegistryController', () => {
         ],
       } as any;
 
-      const result = await controller.resultVulnerabilities({
-        workerId: 'worker-uuid',
-        jobId: 'job-uuid',
-        error: false,
-        vulnerabilities,
-      });
+      const result = await grpc.resultVulnerabilities(
+        { workerId: 'worker-1', jobId: 'job-uuid', error: false, vulnerabilities },
+        metadata,
+      );
 
       const [, passedDto, category] =
         mockJobsRegistryService.updateResultByCategory.mock.calls[0];
@@ -457,12 +750,10 @@ describe('JobsRegistryController', () => {
         values: [{ name: 'CVE-1', severity: 'SEVERITY_UNSPECIFIED' }],
       } as any;
 
-      await controller.resultVulnerabilities({
-        workerId: 'worker-uuid',
-        jobId: 'job-uuid',
-        error: false,
-        vulnerabilities,
-      });
+      await grpc.resultVulnerabilities(
+        { workerId: 'worker-1', jobId: 'job-uuid', error: false, vulnerabilities },
+        metadata,
+      );
 
       const [, passedDto] =
         mockJobsRegistryService.updateResultByCategory.mock.calls[0];

@@ -1,3 +1,4 @@
+import { t } from '@/lib/i18n-dictionary';
 import { useChat } from '@ai-sdk/react';
 import { DefaultChatTransport } from 'ai';
 import type { UIMessage } from 'ai';
@@ -159,6 +160,12 @@ interface SelectedModel {
 
 interface UseAgentChatOptions {
   conversationId: string | undefined;
+  /**
+   * The id was made on the client and the chat is only saved with its first
+   * message (a new chat in the AI panel): there is no history to load yet.
+   * Read once, on mount.
+   */
+  isNew?: boolean;
 }
 
 interface UseAgentChatReturn {
@@ -201,6 +208,8 @@ interface UseAgentChatReturn {
   onDismissError: () => void;
   onLoadMore: (() => void) | undefined;
   onWorkerSelect: (workerId: string | null) => void;
+  /** Picks the project of a new chat, before its first message */
+  onProjectChange: (project: ConversationProjectDto | null) => void;
   pendingApproval: PendingApproval | null;
   pendingApprovalCount: number;
   isDecidingApproval: boolean;
@@ -434,6 +443,7 @@ function mapDbMessagesToUI(
 
 export function useAgentChat({
   conversationId,
+  isNew = false,
 }: UseAgentChatOptions): UseAgentChatReturn {
   const location = useLocation();
   const navigate = useNavigate();
@@ -509,6 +519,7 @@ export function useAgentChat({
   // exists on the server once its first message streams. It has no history
   // to load, and fetching it early just 404s (and retries), so skip that.
   const [createdHereId, setCreatedHereId] = useState(() =>
+    isNew ||
     (location.state as { pendingMessage?: string } | null)?.pendingMessage
       ? conversationId
       : undefined,
@@ -670,7 +681,7 @@ export function useAgentChat({
 
       console.error('[Chat] Error:', error);
       // Always set streamError so the auto-retry effect can evaluate it.
-      setStreamError(error.message ?? 'An error occurred while streaming');
+      setStreamError(error.message ?? t('components.aiChat.streamError'));
 
       // For permanent errors or retries exhausted, reset retry state immediately.
       if (
@@ -913,9 +924,7 @@ export function useAgentChat({
           setStreamError(null);
         } else {
           console.error('[Chat] Failed to submit approval decision', error);
-          setStreamError(
-            'Could not submit approval decision. Please try again.',
-          );
+          setStreamError(t('components.aiChat.approvalSubmitFailed'));
         }
       } finally {
         setIsDecidingApproval(false);
@@ -1016,6 +1025,15 @@ export function useAgentChat({
       await sendMessage({ text: content });
     },
     [sendMessage],
+  );
+
+  // Read when the first message is sent: the chat is saved in this project
+  const handleProjectChange = useCallback(
+    (next: ConversationProjectDto | null) => {
+      setProject(next);
+      projectRef.current = next;
+    },
+    [],
   );
 
   const handleSelectModel = useCallback(
@@ -1370,6 +1388,7 @@ export function useAgentChat({
     onDismissError: handleDismissError,
     onLoadMore: onLoadMoreAction,
     onWorkerSelect: setSelectedWorkerId,
+    onProjectChange: handleProjectChange,
     pendingApproval,
     pendingApprovalCount: approvalQueue.length,
     isDecidingApproval,

@@ -416,10 +416,18 @@ func (ContainerExecutionState) EnumDescriptor() ([]byte, []int) {
 }
 
 type JoinRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ApiKey        string                 `protobuf:"bytes,1,opt,name=api_key,json=apiKey,proto3" json:"api_key,omitempty"`
-	Token         *string                `protobuf:"bytes,3,opt,name=token,proto3,oneof" json:"token,omitempty"`
-	Metadata      *WorkerMetadata        `protobuf:"bytes,4,opt,name=metadata,proto3,oneof" json:"metadata,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	ApiKey   string                 `protobuf:"bytes,1,opt,name=api_key,json=apiKey,proto3" json:"api_key,omitempty"`
+	Token    *string                `protobuf:"bytes,3,opt,name=token,proto3,oneof" json:"token,omitempty"`
+	Metadata *WorkerMetadata        `protobuf:"bytes,4,opt,name=metadata,proto3,oneof" json:"metadata,omitempty"`
+	// HPKE public key (DHKEM P-256, uncompressed point) the worker holds the
+	// private half of. Core seals job secrets to it (Job.sealed). Registered
+	// once per worker identity; a different key on rejoin is ignored.
+	EncryptionPublicKey []byte `protobuf:"bytes,5,opt,name=encryption_public_key,json=encryptionPublicKey,proto3,oneof" json:"encryption_public_key,omitempty"`
+	// Jobs the worker is still running when it (re)joins. Core keeps them
+	// IN_PROGRESS and requeues the worker's other IN_PROGRESS jobs. Older
+	// workers send none, so all of their jobs are requeued, as before.
+	RunningJobIds []string `protobuf:"bytes,6,rep,name=running_job_ids,json=runningJobIds,proto3" json:"running_job_ids,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -471,6 +479,20 @@ func (x *JoinRequest) GetToken() string {
 func (x *JoinRequest) GetMetadata() *WorkerMetadata {
 	if x != nil {
 		return x.Metadata
+	}
+	return nil
+}
+
+func (x *JoinRequest) GetEncryptionPublicKey() []byte {
+	if x != nil {
+		return x.EncryptionPublicKey
+	}
+	return nil
+}
+
+func (x *JoinRequest) GetRunningJobIds() []string {
+	if x != nil {
+		return x.RunningJobIds
 	}
 	return nil
 }
@@ -2726,13 +2748,16 @@ var File_workers_proto protoreflect.FileDescriptor
 
 const file_workers_proto_rawDesc = "" +
 	"\n" +
-	"\rworkers.proto\x12\aworkers\x1a\x1fgoogle/protobuf/timestamp.proto\"\xa3\x01\n" +
+	"\rworkers.proto\x12\aworkers\x1a\x1fgoogle/protobuf/timestamp.proto\"\x9e\x02\n" +
 	"\vJoinRequest\x12\x17\n" +
 	"\aapi_key\x18\x01 \x01(\tR\x06apiKey\x12\x19\n" +
 	"\x05token\x18\x03 \x01(\tH\x00R\x05token\x88\x01\x01\x128\n" +
-	"\bmetadata\x18\x04 \x01(\v2\x17.workers.WorkerMetadataH\x01R\bmetadata\x88\x01\x01B\b\n" +
+	"\bmetadata\x18\x04 \x01(\v2\x17.workers.WorkerMetadataH\x01R\bmetadata\x88\x01\x01\x127\n" +
+	"\x15encryption_public_key\x18\x05 \x01(\fH\x02R\x13encryptionPublicKey\x88\x01\x01\x12&\n" +
+	"\x0frunning_job_ids\x18\x06 \x03(\tR\rrunningJobIdsB\b\n" +
 	"\x06_tokenB\v\n" +
-	"\t_metadataJ\x04\b\x02\x10\x03R\tsignature\"\x88\x01\n" +
+	"\t_metadataB\x18\n" +
+	"\x16_encryption_public_keyJ\x04\b\x02\x10\x03R\tsignature\"\x88\x01\n" +
 	"\x0eWorkerMetadata\x12\x17\n" +
 	"\x04name\x18\x01 \x01(\tH\x00R\x04name\x88\x01\x01\x12\x13\n" +
 	"\x02os\x18\x02 \x01(\tH\x01R\x02os\x88\x01\x01\x12/\n" +

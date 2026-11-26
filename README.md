@@ -289,6 +289,7 @@ This builds and starts console, core API, worker, Postgres, Redis, Geo-IP proxy,
 Notes:
 
 - Set `WORKER_API_KEY` in `worker/.env` to the key the API expects.
+- Opening the console from any address other than `localhost` over plain http (e.g. `http://192.168.1.10:3000`, or a host name without TLS): add that origin to `TRUSTED_ORIGINS` in `core-api/.env` (comma-separated exact origins, no wildcards) and recreate `core-api`. Otherwise sign-in fails with `403 INVALID_ORIGIN`. `TRUSTED_ORIGINS` is the only origin setting; `BASE_URL` is trusted on top of it.
 - On native Linux the worker needs the Docker socket group: `task docker-compose` detects `WORKER_DOCKER_GID` automatically. Raw `docker compose up` needs `WORKER_DOCKER_GID=$(stat -c '%g' /var/run/docker.sock) docker compose up -d --build`.
 - The socket mount is root-equivalent — only run trusted connector images.
 - Pre-built images: `oasm/oasm-console`, `oasm/oasm-api`, `oasm/oasm-worker` on Docker Hub.
@@ -335,7 +336,9 @@ See [`SECURITY.md`](SECURITY.md). Short version: report sensitive vulnerabilitie
 
 ## License
 
-[GNU General Public License v3.0](LICENSE) — see `LICENSE` in the repo root.
+[GNU Affero General Public License v3.0](LICENSE) — see `LICENSE` in the repo root.
+
+If you run a modified version of OASM as a network service, the AGPL requires you to offer its users the complete source of that modified version.
 
 ## Star History
 

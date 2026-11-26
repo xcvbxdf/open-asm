@@ -18,6 +18,7 @@ import (
 	"oasm-worker/internal/filelock"
 	jobRegistryPb "oasm-worker/internal/gen/jobs_registry"
 	workerPb "oasm-worker/internal/gen/workers"
+	"oasm-worker/internal/security"
 )
 
 // tokenFileName is the persisted worker token's file name inside the per-user
@@ -43,12 +44,28 @@ type Client struct {
 	// tokenLock holds tokenFile's slot so no concurrent worker sharing the
 	// location resumes the same identity (see claimTokenFile). Nil = unlocked.
 	tokenLock *filelock.Lock
+	// encKey is the worker's HPKE key, stored at tokenFile+".key". Its public
+	// half goes out on Join and core-api seals job secrets to it (Job.sealed).
+	// Nil when it cannot be stored: the worker then gets secrets in the clear.
+	encKey *security.EncryptionKey
 
 	workers workerPb.WorkersServiceClient
 	jobs    jobRegistryPb.JobsRegistryServiceClient
 
 	mu       sync.RWMutex
 	workerID string
+
+	// claimMu orders claims against Join: a claim holds it shared from its
+	// request until its jobs are recorded in running, Join holds it exclusive
+	// while it reports running. So no job core marked IN_PROGRESS for this
+	// worker is missing from the list core keeps on rejoin.
+	claimMu sync.RWMutex
+	// running holds the claimed jobs whose slot is not released yet; Join
+	// reports them (JoinRequest.running_job_ids). Guarded by runningMu.
+	runningMu sync.Mutex
+	running   map[string]struct{}
+	// claimTimeout bounds one claim RPC: Join waits for claims in flight.
+	claimTimeout time.Duration // default 30s
 
 	// Unexported for test control (same-package tests only).
 	connectBaseDelay time.Duration // default 2s
@@ -132,6 +149,8 @@ func NewClient(apiKey, grpcHost, toolPath string, logger Logger, dialOpts ...grp
 		telemetryMaxDelay:    30 * time.Second,
 		telemetryCallTimeout: 3 * time.Second,
 		jobsAvailable:        make(chan struct{}, 1),
+		running:              make(map[string]struct{}),
+		claimTimeout:         30 * time.Second,
 	}
 
 	c.tokenFile, c.tokenLock = claimTokenFile(resolveTokenFilePath(), logger)
@@ -143,8 +162,32 @@ func NewClient(apiKey, grpcHost, toolPath string, logger Logger, dialOpts ...grp
 		// reaps any orphaned IN_PROGRESS jobs, so a fresh identity is safe.
 		logger.Warning("no worker token file at %s — will register as a NEW worker on join (core auto-cleanup reaps orphaned jobs)", c.tokenFile)
 	}
+	if c.encKey, err = security.LoadOrCreateEncryptionKey(c.tokenFile + ".key"); err != nil {
+		logger.Warning("no encryption key (%v) — job secrets will arrive unsealed", err)
+	}
 
 	return c, nil
+}
+
+// EncryptionPublicKey is the key sent on Join, or nil without one.
+func (c *Client) EncryptionPublicKey() []byte {
+	if c.encKey == nil {
+		return nil
+	}
+	return c.encKey.PublicKey()
+}
+
+// OpenJobSecrets opens a job's sealed config and secret inputs (Job.sealed).
+// Both maps are nil when the job carries no sealed bundle.
+func (c *Client) OpenJobSecrets(job *jobRegistryPb.Job) (config, inputs map[string]any, err error) {
+	sealed := job.GetSealed()
+	if sealed == nil {
+		return nil, nil, nil
+	}
+	if c.encKey == nil {
+		return nil, nil, fmt.Errorf("job %s is sealed but this worker holds no encryption key", job.GetId())
+	}
+	return c.encKey.OpenJobSecrets(sealed.GetEnc(), sealed.GetCiphertext(), job.GetId(), c.WorkerID())
 }
 
 // resolveTokenFilePath returns WORKER_TOKEN_FILE when set, otherwise the

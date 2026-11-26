@@ -1,8 +1,15 @@
 import { UserContext, WorkspaceId } from '@/common/decorators/app.decorator';
 import { WorkspaceAccess } from '@/common/decorators/workspace-access.decorator';
 import { Doc } from '@/common/doc/doc.decorator';
-import { GetManyResponseDto } from '@/utils/getManyResponse';
-import { Controller, Delete, Get, Param, Query } from '@nestjs/common';
+import { GetManyResponseDto } from '@/common/utils/get-many-response.util';
+import {
+  Controller,
+  Delete,
+  Get,
+  Param,
+  ParseUUIDPipe,
+  Query,
+} from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { User } from '../auth/entities/user.entity';
 import { DeleteResponseDto } from './dto/delete-response.dto';
@@ -62,7 +69,10 @@ export class SearchController {
     },
   })
   @Delete('histories/:id')
-  deleteSearchHistory(@UserContext() user: User, @Param('id') id: string) {
+  deleteSearchHistory(
+    @UserContext() user: User,
+    @Param('id', ParseUUIDPipe) id: string,
+  ) {
     return this.searchService.deleteSearchHistory(user, id);
   }
 

@@ -1,10 +1,12 @@
 import { WorkspacesService } from '@/modules/workspaces/workspaces.service';
-import { BadRequestException, CanActivate, ExecutionContext, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, CanActivate, ExecutionContext, ForbiddenException, Injectable } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { WorkspacePermissions } from '../decorators/workspace-permissions.decorator';
 import { getWorkspaceIdFromRequest } from '../decorators/workspace-id.decorator';
 import { RequestWithMetadata } from '../interfaces/app.interface';
+import { firstMissingPermission } from '../utils/permission-keys.util';
 import { isUUID } from 'class-validator';
+import { isNotFound } from '@/common/errors/error-checks';
 
 // Same check `WorkspaceId` uses, applied here so a malformed header is a 400
 // instead of a Postgres UUID-cast 500 from the membership lookup.
@@ -84,7 +86,7 @@ export class WorkspacePermissionGuard implements CanActivate {
       request.membership = resolved.membership;
     } catch (error) {
       // Non-members get 403, never revealing whether the workspace exists
-      if (error instanceof NotFoundException) {
+      if (isNotFound(error)) {
         throw new ForbiddenException(
           'You do not have permission to perform this action',
         );
@@ -100,17 +102,7 @@ export class WorkspacePermissionGuard implements CanActivate {
     );
 
     if (required && required.length > 0) {
-      const hasWildcard = permissionKeys.includes('*');
-      const hasAll = required.every((key) => {
-        if (permissionKeys.includes(key)) return true;
-        // {domain}.write implies {domain}.read
-        if (key.endsWith('.read')) {
-          const writeKey = `${key.slice(0, -'.read'.length)}.write`;
-          return permissionKeys.includes(writeKey);
-        }
-        return false;
-      });
-      if (!hasWildcard && !hasAll) {
+      if (firstMissingPermission(permissionKeys, required) !== null) {
         throw new ForbiddenException(
           'You do not have permission to perform this action',
         );

@@ -1,18 +1,20 @@
+import {
+  LAST_SEEN_WRITE_INTERVAL_MS,
+  WORKER_TIMEOUT,
+} from '@/common/constants/app.constants';
 import { JobStatus, WorkerScope, WorkerType } from '@/common/enums/enum';
 import { ConfigService } from '@nestjs/config';
-import { NotFoundException } from '@nestjs/common';
+
 import type { TestingModule } from '@nestjs/testing';
 import { Test } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import type { Repository } from 'typeorm';
-import { Asset } from '../assets/entities/assets.entity';
 import { ConnectorRegistryService } from '../connectors/connector-registry.service';
 import { EVENT_CATALOG } from '../event-bridge/contracts/event-catalog';
 import { EventBridgeService } from '../event-bridge/publishing/event-bridge.service';
-import { JobsRegistryService } from '../jobs-registry/jobs-registry.service';
+import { Job } from '../jobs-registry/entities/job.entity';
 import { InternalNetwork } from '../internal-networks/entities/internal-network.entity';
 import { NetworkInterface } from '../internal-networks/entities/network-interface.entity';
-import { WorkspaceTool } from '../tools/entities/workspace_tools.entity';
 import { ToolsService } from '../tools/tools.service';
 import { RedisService } from '@/services/redis/redis.service';
 import { GeoIpService } from '@/services/geo-ip/geo-ip.service';
@@ -21,15 +23,14 @@ import { WorkerInstance } from './entities/worker.entity';
 import { WORKER_NAME_MAX_LENGTH, WorkersService } from './workers.service';
 import { WorkerJoinKeyService } from './worker-join-key.service';
 import { WorkerTelemetryService } from './worker-telemetry.service';
+import { NotFoundError } from '@/common/errors/domain.errors';
 
 describe('WorkersService', () => {
   let service: WorkersService;
   let mockWorkerInstanceRepository: Partial<Repository<WorkerInstance>>;
-  let mockAssetRepository: Partial<Repository<any>>;
-  let mockWorkspaceToolRepository: Partial<Repository<any>>;
   let mockInternalNetworkRepository: Partial<Repository<any>>;
   let mockNetworkInterfaceRepository: Partial<Repository<any>>;
-  let mockJobsRegistryService: Partial<JobsRegistryService>;
+  let mockJobsRegistryService: { repo: Record<string, jest.Mock> };
   let mockJoinKeyService: { consume: jest.Mock };
   let mockConfigService: Partial<ConfigService>;
   let mockToolsService: Partial<ToolsService>;
@@ -62,14 +63,6 @@ describe('WorkersService', () => {
       exists: jest.fn(),
     } as any;
 
-    mockAssetRepository = {
-      findOne: jest.fn(),
-    } as any;
-
-    mockWorkspaceToolRepository = {
-      findOne: jest.fn(),
-    } as any;
-
     mockInternalNetworkRepository = {
       findOne: jest.fn(),
     } as any;
@@ -87,7 +80,7 @@ describe('WorkersService', () => {
         andWhere: jest.fn().mockReturnThis(),
         execute: jest.fn(),
       },
-    } as any;
+    };
 
     mockJoinKeyService = { consume: jest.fn().mockResolvedValue(null) };
 
@@ -133,14 +126,6 @@ describe('WorkersService', () => {
           useValue: mockWorkerInstanceRepository,
         },
         {
-          provide: getRepositoryToken(Asset),
-          useValue: mockAssetRepository,
-        },
-        {
-          provide: getRepositoryToken(WorkspaceTool),
-          useValue: mockWorkspaceToolRepository,
-        },
-        {
           provide: getRepositoryToken(InternalNetwork),
           useValue: mockInternalNetworkRepository,
         },
@@ -149,8 +134,8 @@ describe('WorkersService', () => {
           useValue: mockNetworkInterfaceRepository,
         },
         {
-          provide: JobsRegistryService,
-          useValue: mockJobsRegistryService,
+          provide: getRepositoryToken(Job),
+          useValue: mockJobsRegistryService.repo,
         },
         {
           provide: WorkerJoinKeyService,
@@ -677,6 +662,63 @@ describe('WorkersService', () => {
       );
     });
 
+    describe('encryption key', () => {
+      // A valid uncompressed P-256 point (the worker sealing fixture's key).
+      const workerKey = Buffer.from(
+        '048f2c1839582ec03f19e8d7c573e64ee1b4d53a6f89647491e3ecc54fbe5623cdce67bd25f51b6a46593576ebdfef573b5f4e95cb4ca8874de3e7b413037fd712',
+        'hex',
+      );
+      const rejoinAs = (stored: string | null) => {
+        const worker = { id: 'w-1', token: 'tok-1', encryptionPublicKey: stored };
+        (mockWorkerInstanceRepository.findOne as jest.Mock).mockResolvedValue(worker);
+        (mockWorkerInstanceRepository.update as jest.Mock).mockResolvedValue(undefined);
+      };
+      const updatedFields = () =>
+        (mockWorkerInstanceRepository.update as jest.Mock).mock.calls.map(
+          ([, fields]: [unknown, Record<string, unknown>]) => fields,
+        );
+
+      it('stores the key of a new worker', async () => {
+        mockJoinKeyService.consume.mockResolvedValue({ id: 'jk-1', workspaceId: 'ws-1' });
+        (mockWorkerInstanceRepository.findOne as jest.Mock).mockResolvedValue({ id: 'w-1' });
+
+        await service.join({ apiKey: 'join-key-1', encryptionPublicKey: workerKey });
+
+        const saved = (mockWorkerInstanceRepository.save as jest.Mock).mock.calls[0][0];
+        expect(saved.encryptionPublicKey).toBe(workerKey.toString('base64'));
+      });
+
+      it('enrolls the key of an existing worker that had none (upgraded worker)', async () => {
+        rejoinAs(null);
+
+        await service.join({ apiKey: 'x', token: 'tok-1', encryptionPublicKey: workerKey });
+
+        expect(updatedFields()).toContainEqual(
+          expect.objectContaining({ encryptionPublicKey: workerKey.toString('base64') }),
+        );
+      });
+
+      it('never replaces a registered key: a stolen token must not swap in its own', async () => {
+        rejoinAs('registered-key');
+
+        await service.join({ apiKey: 'x', token: 'tok-1', encryptionPublicKey: workerKey });
+
+        for (const fields of updatedFields()) {
+          expect(fields).not.toHaveProperty('encryptionPublicKey');
+        }
+      });
+
+      it('ignores a malformed key', async () => {
+        rejoinAs(null);
+
+        await service.join({ apiKey: 'x', token: 'tok-1', encryptionPublicKey: Buffer.alloc(65) });
+
+        for (const fields of updatedFields()) {
+          expect(fields).not.toHaveProperty('encryptionPublicKey');
+        }
+      });
+    });
+
     it('rejects a key that is unknown, expired, already used or a legacy DB key', async () => {
       mockJoinKeyService.consume.mockResolvedValue(null);
 
@@ -846,7 +888,9 @@ describe('WorkersService', () => {
 
       await service.workerDisconnected('worker-1');
 
-      expect((mockJobsRegistryService.repo as any).execute).toHaveBeenCalled();
+      // The worker usually keeps running its jobs through a dropped stream
+      // (a core-api restart, a network blip); a dead one is swept instead.
+      expect((mockJobsRegistryService.repo as any).execute).not.toHaveBeenCalled();
       expect(mockEventBridge.publishSafely).toHaveBeenCalledWith(
         EVENT_CATALOG.worker.disconnected,
         expect.objectContaining({
@@ -866,6 +910,52 @@ describe('WorkersService', () => {
       await service.workerDisconnected('worker-1');
 
       expect(mockEventBridge.publishSafely).not.toHaveBeenCalled();
+    });
+
+    it('requeues only the jobs a rejoining worker no longer runs, trusting no malformed id', async () => {
+      // Given: a worker reporting two running jobs, one id malformed
+      (mockConfigService.get as jest.Mock).mockReturnValue(undefined);
+      (mockWorkerInstanceRepository.findOne as jest.Mock).mockResolvedValue({
+        id: 'w-existing',
+        token: 'tok-existing',
+        workspaceId: 'ws-1',
+      });
+      const running = '6f1c2f3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f';
+
+      // When
+      await service.join(
+        { apiKey: 'api-key-1', token: 'tok-existing' },
+        { runningJobIds: [running, "x' OR 1=1 --"] },
+      );
+
+      // Then: one requeue, scoped to the worker, sparing the valid id only
+      const repo = mockJobsRegistryService.repo as any;
+      expect(repo.execute).toHaveBeenCalledTimes(1);
+      expect(repo.andWhere).toHaveBeenCalledWith(
+        expect.stringContaining('ANY'),
+        { running: [running] },
+      );
+    });
+
+    it('requeues every in-progress job of a worker that reports none', async () => {
+      // Given: an older worker build, which sends no list
+      (mockConfigService.get as jest.Mock).mockReturnValue(undefined);
+      (mockWorkerInstanceRepository.findOne as jest.Mock).mockResolvedValue({
+        id: 'w-existing',
+        token: 'tok-existing',
+        workspaceId: 'ws-1',
+      });
+
+      // When
+      await service.join({ apiKey: 'api-key-1', token: 'tok-existing' });
+
+      // Then: the previous behaviour, nothing spared
+      const repo = mockJobsRegistryService.repo as any;
+      expect(repo.execute).toHaveBeenCalledTimes(1);
+      expect(repo.andWhere).not.toHaveBeenCalledWith(
+        expect.stringContaining('ANY'),
+        expect.anything(),
+      );
     });
 
     it('publishes worker.rejoined on a token rejoin', async () => {
@@ -889,6 +979,67 @@ describe('WorkersService', () => {
         }),
         expect.anything(),
       );
+    });
+  });
+
+  describe('alive', () => {
+    const now = 1_000_000_000;
+
+    beforeEach(() => {
+      jest.spyOn(Date, 'now').mockReturnValue(now);
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it('records the heartbeat once lastSeenAt is older than the write interval', async () => {
+      // Given
+      (mockWorkerInstanceRepository.findOne as jest.Mock).mockResolvedValue({
+        id: 'w-1',
+        token: 'tok',
+        lastSeenAt: new Date(now - LAST_SEEN_WRITE_INTERVAL_MS),
+      });
+
+      // When
+      const worker = await service.alive({ token: 'tok' });
+
+      // Then: one read, one write, and the caller sees the new timestamp
+      expect(mockWorkerInstanceRepository.findOne).toHaveBeenCalledTimes(1);
+      expect(mockWorkerInstanceRepository.update).toHaveBeenCalledWith(
+        { id: 'w-1' },
+        { lastSeenAt: new Date(now) },
+      );
+      expect(worker.lastSeenAt).toEqual(new Date(now));
+    });
+
+    it('skips the write while lastSeenAt is recent', async () => {
+      // Given: the previous heartbeat was written 10 s ago
+      (mockWorkerInstanceRepository.findOne as jest.Mock).mockResolvedValue({
+        id: 'w-1',
+        token: 'tok',
+        lastSeenAt: new Date(now - 10_000),
+      });
+
+      // When
+      const worker = await service.alive({ token: 'tok' });
+
+      // Then
+      expect(mockWorkerInstanceRepository.update).not.toHaveBeenCalled();
+      expect(worker.id).toBe('w-1');
+    });
+
+    it('rejects an unknown token', async () => {
+      (mockWorkerInstanceRepository.findOne as jest.Mock).mockResolvedValue(null);
+
+      await expect(service.alive({ token: 'nope' })).rejects.toThrow('Invalid token');
+      expect(mockWorkerInstanceRepository.update).not.toHaveBeenCalled();
+    });
+
+    it('stays well inside the timeout the sweep uses', () => {
+      // A connected worker must never look stale to the sweep: one missed
+      // heartbeat (10 s) on top of a skipped write still lands under it.
+      expect(LAST_SEEN_WRITE_INTERVAL_MS + 10_000).toBeLessThan(WORKER_TIMEOUT);
     });
   });
 
@@ -1435,7 +1586,7 @@ describe('WorkersService', () => {
     it('throws NotFoundException when the worker does not exist', async () => {
       await expect(
         runGetWorkerById(null, builtInToolFixtures, connectorFixtures),
-      ).rejects.toThrow(NotFoundException);
+      ).rejects.toThrow(NotFoundError);
     });
 
     it('throws NotFoundException when the worker belongs to another workspace', async () => {
@@ -1448,7 +1599,7 @@ describe('WorkersService', () => {
           },
           builtInToolFixtures,
         ),
-      ).rejects.toThrow(NotFoundException);
+      ).rejects.toThrow(NotFoundError);
     });
 
     const cloudWorker = {
@@ -1474,7 +1625,7 @@ describe('WorkersService', () => {
     it('hides a cloud worker, and the jobs of other workspaces on it, from other callers', async () => {
       await expect(
         runGetWorkerById(cloudWorker, builtInToolFixtures),
-      ).rejects.toThrow(NotFoundException);
+      ).rejects.toThrow(NotFoundError);
       expect(
         (mockJobsRegistryService.repo as any).createQueryBuilder,
       ).not.toHaveBeenCalled();
